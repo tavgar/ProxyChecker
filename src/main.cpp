@@ -70,6 +70,7 @@ struct Settings {
 	int requestTimeoutMs = 900;
 	Protocol defaultProtocol = Protocol::HTTP;
 	bool mergeOutputs = true;
+	bool keepParts = false;
 	bool quiet = false;
 	int maxOpenFiles = 262144; // attempt to raise
 };
@@ -300,7 +301,7 @@ private:
 			refill();
 		}
 
-		if (out_.is_open()) out_.flush();
+		if (out_.is_open()) { out_.flush(); out_.close(); }
 		if (epfd_ >= 0) close(epfd_);
 	}
 
@@ -712,6 +713,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--request-timeout") { const char* v = need("--request-timeout"); if (!v) return false; s.requestTimeoutMs = std::max(1, atoi(v)); }
 		else if (a == "--default-proto") { const char* v = need("--default-proto"); if (!v) return false; std::string pv = v; if (pv == "http") s.defaultProtocol = Protocol::HTTP; else if (pv == "socks4") s.defaultProtocol = Protocol::SOCKS4; else if (pv == "socks5") s.defaultProtocol = Protocol::SOCKS5; else { std::cerr << "Unknown proto: " << pv << "\n"; return false; } }
 		else if (a == "--no-merge") { s.mergeOutputs = false; }
+		else if (a == "--keep-parts") { s.keepParts = true; }
 		else if (a == "--quiet") { s.quiet = true; }
 		else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
@@ -767,8 +769,7 @@ int main(int argc, char** argv) {
 	for (int i = 0; i < workers; ++i) {
 		workerObjs.emplace_back(std::make_unique<Worker>(i, settings, std::move(shards[(size_t)i]), counters));
 	}
-	uint64_t totalWork = 0;
-	for (const auto& shard : shards) totalWork += shard.size();
+	uint64_t totalWork = (uint64_t)all.size();
 	logf(settings.quiet, "Starting %d workers, total proxies: %" PRIu64, workers, totalWork);
 	for (auto& w : workerObjs) w->start();
 	for (auto& w : workerObjs) w->join();
@@ -778,15 +779,28 @@ int main(int argc, char** argv) {
 	// Merge outputs
 	if (settings.mergeOutputs && !settings.outputFile.empty()) {
 		std::ofstream merged(settings.outputFile, std::ios::out | std::ios::trunc);
-		if (merged.is_open()) {
+		if (!merged.is_open()) {
+			logf(settings.quiet, "Warning: failed to open merged output %s", settings.outputFile.c_str());
+		} else {
 			for (int i = 0; i < workers; ++i) {
 				std::string part = settings.outputFile + "." + std::to_string(i);
-				std::ifstream in(part);
-				if (!in.is_open()) continue;
-				merged << in.rdbuf();
+				std::ifstream in(part, std::ios::in | std::ios::binary);
+				if (!in.is_open()) {
+					continue;
+				}
+				char buffer[1 << 16];
+				while (in) {
+					in.read(buffer, sizeof(buffer));
+					std::streamsize n = in.gcount();
+					if (n > 0) {
+						merged.write(buffer, n);
+					}
+				}
+				merged.flush();
 				in.close();
-				unlink(part.c_str());
+				if (!settings.keepParts) unlink(part.c_str());
 			}
+			merged.flush();
 			merged.close();
 		}
 	}
