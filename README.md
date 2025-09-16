@@ -1,20 +1,38 @@
 # ProxyChecker
 
-**ProxyChecker** is a high-speed tool that takes a list of proxies in the `ip:port` format and quickly identifies which ones are working.
+A blazing-fast, epoll-based, multi-threaded proxy checker written in C++20.
 
-## How It Works
+- Two-stage verification: fast handshake + full HTTP verification
+- Supports HTTP, SOCKS4, SOCKS5
+- Highly parallel with per-thread epoll and sharded inputs
+- Aggressive timeouts and socket tuning for speed
 
-ProxyChecker performs a two-stage check on each proxy:
+## Build
 
-1. **Fast preliminary check** — Establishes a TCP connection and performs a minimal protocol handshake (HTTP `HEAD` or SOCKS handshake) to quickly discard dead proxies.
-2. **Full verification** — Sends an HTTP request through the proxy to known websites and marks the proxy as working only if a `200 OK` response is received.
+```bash
+make -C ProxyChecker -j
+```
 
-This approach makes it possible to test **thousands of proxies in just a few seconds**.
+## Usage
 
-## Why It’s Special
+```bash
+./proxychecker --in proxies.txt --out good.txt \
+  --workers 8 --concurrency 4096 \
+  --test-host example.com --test-port 80 --test-path / \
+  --connect-timeout 300 --handshake-timeout 500 --request-timeout 800 \
+  --default-proto http
+```
 
-* **Blazing fast** — Highly parallelized and optimized for speed.
-* **Reliable** — Verifies both connectivity and actual data forwarding.
-* **Cross-protocol** — Supports , , and  proxies.
-* **Written in ** — Delivers maximum performance and minimal overhead.
+Input file format:
+- `ip:port`
+- `proto://ip:port` where proto in `http`, `socks4`, `socks5`
+- Or `ip:port,proto`
+
+Output file contains one working proxy per line in `proto://ip:port` format.
+
+## Notes
+
+- Only numeric IPs are resolved currently to avoid DNS overhead. Add hostnames with caution.
+- Requires high `ulimit -n`; the program attempts to raise it.
+- Designed for Linux with `epoll`.
 
