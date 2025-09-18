@@ -21,7 +21,7 @@ make -C ProxyChecker -j
 ./proxychecker --in proxies.txt --out good.txt \
   --workers 8 --concurrency 4096 \
   --test-host ifconfig.io --test-port 443 --test-path / \
-  --connect-timeout 300 --handshake-timeout 500 --request-timeout 800 \
+  --timeout 2 \
   --default-proto http --http-mode connect
 ```
 
