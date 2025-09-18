@@ -753,10 +753,7 @@ static void usage(const char* argv0) {
 	std::cerr << "  --test-host HOST      Target host for verification (default: example.com)\n";
 	std::cerr << "  --test-port PORT      Target port for verification (default: 443)\n";
 	std::cerr << "  --test-path PATH      HTTP path for verification (default: /)\n";
-	std::cerr << "  --timeout MS          Set connect/handshake/request timeouts to the same value\n";
-	std::cerr << "  --connect-timeout MS  TCP connect timeout (default: 2000)\n";
-	std::cerr << "  --handshake-timeout MS Handshake timeout (default: 3000)\n";
-	std::cerr << "  --request-timeout MS  HTTP request timeout (default: 5000)\n";
+    std::cerr << "  --timeout S           Base timeout in seconds; scales internal timeouts proportionally\n";
 	std::cerr << "  --default-proto [http|socks4|socks5] (default: http)\n";
 	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
@@ -787,10 +784,17 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--test-host") { const char* v = need("--test-host"); if (!v) return false; s.testHost = v; }
 		else if (a == "--test-port") { const char* v = need("--test-port"); if (!v) return false; s.testPort = (uint16_t)atoi(v); }
 		else if (a == "--test-path") { const char* v = need("--test-path"); if (!v) return false; s.testPath = v; }
-		else if (a == "--timeout") { const char* v = need("--timeout"); if (!v) return false; int t = std::max(1, atoi(v)); s.connectTimeoutMs = t; s.handshakeTimeoutMs = t; s.requestTimeoutMs = t; }
-		else if (a == "--connect-timeout") { const char* v = need("--connect-timeout"); if (!v) return false; s.connectTimeoutMs = std::max(1, atoi(v)); }
-		else if (a == "--handshake-timeout") { const char* v = need("--handshake-timeout"); if (!v) return false; s.handshakeTimeoutMs = std::max(1, atoi(v)); }
-		else if (a == "--request-timeout") { const char* v = need("--request-timeout"); if (!v) return false; s.requestTimeoutMs = std::max(1, atoi(v)); }
+    else if (a == "--timeout") {
+            const char* v = need("--timeout");
+            if (!v) return false;
+            // value is in seconds; compute proportional timeouts in milliseconds
+            int seconds = std::max(1, atoi(v));
+            int baseMs = seconds * 1000;
+            // Proportional scaling: connect=1.0x, handshake=1.5x, request=2.5x
+            s.connectTimeoutMs = baseMs;
+            s.handshakeTimeoutMs = (int)(baseMs * 1.5);
+            s.requestTimeoutMs = (int)(baseMs * 2.5);
+        }
 		else if (a == "--default-proto") { const char* v = need("--default-proto"); if (!v) return false; std::string pv = v; if (pv == "http") s.defaultProtocol = Protocol::HTTP; else if (pv == "socks4") s.defaultProtocol = Protocol::SOCKS4; else if (pv == "socks5") s.defaultProtocol = Protocol::SOCKS5; else { std::cerr << "Unknown proto: " << pv << "\n"; return false; } s.defaultProtocolForced = true; }
 		else if (a == "--http-mode") { const char* v = need("--http-mode"); if (!v) return false; std::string hv = v; if (hv == "connect") s.httpMode = HttpMode::CONNECT; else if (hv == "direct") s.httpMode = HttpMode::DIRECT; else { std::cerr << "Unknown http mode: " << hv << "\n"; return false; } }
 		else if (a == "--no-merge") { s.mergeOutputs = false; }
