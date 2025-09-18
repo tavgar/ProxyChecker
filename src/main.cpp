@@ -86,6 +86,8 @@ struct Settings {
 	bool quiet = false;
 	int maxOpenFiles = 262144; // attempt to raise
 	HttpMode httpMode = HttpMode::CONNECT;
+    // Baseline public IP of this machine (fetched once when possible)
+    std::string clientPublicIP;
     // New: CIDR range scanning (mutually exclusive with --in)
     std::string rangeCIDR;
     // New: multiple CIDR ranges from file (mutually exclusive with --in/--range)
@@ -105,6 +107,35 @@ struct Settings {
 
 static inline uint64_t nowMs() {
 	return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Extract first IPv4 address from buffer; returns true if found
+static bool extractFirstIPv4FromBuffer(const char* data, size_t len, std::string& out) {
+    auto isDigit = [](char c){ return c >= '0' && c <= '9'; };
+    for (size_t i = 0; i < len; ++i) {
+        size_t p = i;
+        int octets[4];
+        bool ok = true;
+        for (int oct = 0; oct < 4; ++oct) {
+            if (p >= len || !isDigit(data[p])) { ok = false; break; }
+            int val = 0; size_t digits = 0;
+            while (p < len && isDigit(data[p]) && digits < 3) { val = val * 10 + (data[p] - '0'); ++p; ++digits; }
+            if (val > 255) { ok = false; break; }
+            if (digits == 0) { ok = false; break; }
+            octets[oct] = val;
+            if (oct < 3) {
+                if (p >= len || data[p] != '.') { ok = false; break; }
+                ++p;
+            }
+        }
+        if (ok) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
+            out.assign(buf);
+            return true;
+        }
+    }
+    return false;
 }
 
 static int setNonBlocking(int fd) {
@@ -234,6 +265,8 @@ enum class SessionState : uint8_t {
 	HTTP_CONNECT_RECV,
 	HTTP_SEND,
 	HTTP_RECV,
+	HTTP_TUNNEL_HTTP_SEND,
+	HTTP_TUNNEL_HTTP_RECV,
 	S5_METHOD_SEND,
 	S5_METHOD_RECV,
 	S5_CONNECT_SEND,
@@ -255,6 +288,7 @@ struct Session {
 	std::string proxyHost;
 	uint16_t proxyPort{0};
     std::optional<HttpMode> httpModeOverride; // honored when proto==HTTP
+	bool requireIpMasking{false}; // for HTTP proxies when validating via testHost on port 80
 	// Buffers
 	std::string writeBuf;
 	std::string readBuf;
@@ -262,6 +296,10 @@ struct Session {
 	// For parsing HTTP
 	bool statusParsed{false};
 	int statusCode{0};
+	// Track header/body split when parsing HTTP for IP masking
+	bool headersComplete{false};
+	// Track whether the last HTTP request was GET (vs HEAD)
+	bool lastWasGet{false};
 	// For worker context
 	class Worker* worker{nullptr};
 };
@@ -359,6 +397,36 @@ private:
 	int active_{0};
 
 	static constexpr int kMaxEvents = 4096;
+
+	// Extract first IPv4 address from a text buffer; returns true and sets out if found
+	static bool extractFirstIPv4(const char* data, size_t len, std::string& out) {
+		auto isDigit = [](char c){ return c >= '0' && c <= '9'; };
+		for (size_t i = 0; i < len; ++i) {
+			// Try parse a.b.c.d starting at i
+			size_t p = i;
+			int octets[4];
+			bool ok = true;
+			for (int oct = 0; oct < 4; ++oct) {
+				if (p >= len || !isDigit(data[p])) { ok = false; break; }
+				int val = 0; size_t start = p; size_t digits = 0;
+				while (p < len && isDigit(data[p]) && digits < 3) { val = val * 10 + (data[p] - '0'); ++p; ++digits; }
+				if (val > 255) { ok = false; break; }
+				if (digits == 0) { ok = false; break; }
+				octets[oct] = val;
+				if (oct < 3) {
+					if (p >= len || data[p] != '.') { ok = false; break; }
+					++p;
+				}
+			}
+			if (ok) {
+				char buf[16];
+				snprintf(buf, sizeof(buf), "%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
+				out.assign(buf);
+				return true;
+			}
+		}
+		return false;
+	}
 
     void run() {
 		std::string outPath = settings_.outputFile.empty()
@@ -550,6 +618,8 @@ private:
 		sess->proxyHost = tgt.host;
 		sess->proxyPort = tgt.port;
 		sess->httpModeOverride = tgt.httpModeOverride;
+		// For HTTP protocol, require masking when testing via HTTP on port 80
+		sess->requireIpMasking = (tgt.protocol == Protocol::HTTP) && (settings_.testPort == 80);
 		sess->worker = this;
 		sess->state = SessionState::CONNECTING;
 		sess->writeBuf.clear();
@@ -557,6 +627,8 @@ private:
 		sess->writeOffset = 0;
 		sess->statusParsed = false;
 		sess->statusCode = 0;
+		sess->headersComplete = false;
+		sess->lastWasGet = false;
 
 		epoll_event ev{};
 		ev.events = EPOLLOUT; // wait connect complete
@@ -581,17 +653,17 @@ private:
 				return;
 			}
 			// Connected
-			switch (sess->proto) {
+				switch (sess->proto) {
 				case Protocol::HTTP: {
 					HttpMode mode = sess->httpModeOverride.has_value() ? *sess->httpModeOverride : settings_.httpMode;
-					bool useConnect = (mode == HttpMode::CONNECT) || (settings_.testPort != 80);
+						bool useConnect = (mode == HttpMode::CONNECT) || (settings_.testPort != 80);
 					if (useConnect) {
 						prepareHttpConnect(sess, settings_.testHost, settings_.testPort);
 						sess->state = SessionState::HTTP_CONNECT_SEND;
 						setDeadline(sess, settings_.handshakeTimeoutMs);
 					} else {
-						prepareHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
-						sess->state = SessionState::HTTP_SEND;
+							prepareHttpGet(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+							sess->state = SessionState::HTTP_SEND;
 						setDeadline(sess, settings_.handshakeTimeoutMs);
 					}
 					break;
@@ -617,9 +689,10 @@ private:
 		}
 		if (sess->writeOffset >= sess->writeBuf.size()) {
 			// Move to expected read stage
-			switch (sess->state) {
+		switch (sess->state) {
 				case SessionState::HTTP_CONNECT_SEND: sess->state = SessionState::HTTP_CONNECT_RECV; setDeadline(sess, settings_.requestTimeoutMs); arm(sess, true, false); break;
 				case SessionState::HTTP_SEND: sess->state = SessionState::HTTP_RECV; setDeadline(sess, settings_.requestTimeoutMs); arm(sess, true, false); break;
+				case SessionState::HTTP_TUNNEL_HTTP_SEND: sess->state = SessionState::HTTP_TUNNEL_HTTP_RECV; setDeadline(sess, settings_.requestTimeoutMs); arm(sess, true, false); break;
 				case SessionState::S5_METHOD_SEND: sess->state = SessionState::S5_METHOD_RECV; arm(sess, true, false); break;
 				case SessionState::S5_CONNECT_SEND: sess->state = SessionState::S5_CONNECT_RECV; arm(sess, true, false); break;
 				case SessionState::S4_CONNECT_SEND: sess->state = SessionState::S4_CONNECT_RECV; arm(sess, true, false); break;
@@ -644,6 +717,8 @@ private:
 			case SessionState::HTTP_CONNECT_RECV: parseHttpStatus(sess);
 				break;
 			case SessionState::HTTP_RECV: parseHttpStatus(sess);
+				break;
+			case SessionState::HTTP_TUNNEL_HTTP_RECV: parseHttpStatus(sess);
 				break;
 			case SessionState::S5_METHOD_RECV: parseSocks5Method(sess);
 				break;
@@ -691,11 +766,33 @@ private:
 		out += "User-Agent: ProxyChecker/0.1\r\n";
 		out += "Connection: close\r\n\r\n";
 	}
+	static void buildHttpGet(std::string& out, const std::string& host, uint16_t port, const std::string& path, bool absoluteForm) {
+		out.clear();
+		std::string hostHeader = host;
+		if (!(port == 80 || port == 443)) hostHeader += ":" + std::to_string(port);
+		if (absoluteForm) {
+			out += "GET http://";
+			out += hostHeader;
+			out += path;
+			out += " HTTP/1.1\r\n";
+		} else {
+			out += "GET ";
+			out += path;
+			out += " HTTP/1.1\r\n";
+		}
+		out += "Host: ";
+		out += hostHeader;
+		out += "\r\n";
+		out += "User-Agent: ProxyChecker/0.1\r\n";
+		out += "Accept: text/plain, text/*;q=0.9, */*;q=0.1\r\n";
+		out += "Connection: close\r\n\r\n";
+	}
 
 	void prepareHttpHead(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
 		buildHttpHead(sess->writeBuf, host, port, path, /*absoluteForm*/true);
 		sess->writeOffset = 0;
 		sess->readBuf.clear();
+		sess->lastWasGet = false;
 	}
 
 	void prepareHttpConnect(Session* sess, const std::string& host, uint16_t port) {
@@ -761,33 +858,97 @@ private:
 		sess->readBuf.clear();
 	}
 
+	void prepareHttpGet(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
+		buildHttpGet(sess->writeBuf, host, port, path, /*absoluteForm*/true);
+		sess->writeOffset = 0;
+		sess->readBuf.clear();
+		sess->lastWasGet = true;
+	}
+
+	void prepareTunneledHttpGet(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
+		buildHttpGet(sess->writeBuf, host, port, path, /*absoluteForm*/false);
+		sess->writeOffset = 0;
+		sess->readBuf.clear();
+		sess->lastWasGet = true;
+	}
+
 	void parseHttpStatus(Session* sess) {
-		// Look for first CRLF
-		size_t pos = sess->readBuf.find("\r\n");
-		if (pos == std::string::npos) {
+		// Ensure we have at least a status line
+		size_t lineEnd = sess->readBuf.find("\r\n");
+		if (lineEnd == std::string::npos) {
 			if (sess->readBuf.size() > 16384) { failSession(sess); }
 			return;
 		}
-		// Parse status code
-		// Expect: HTTP/1.1 200 OK
-		int code = 0;
-		const char* data = sess->readBuf.data();
-		size_t len = pos;
-		// Find first space then parse number after
-		size_t sp = sess->readBuf.find(' ');
-		if (sp != std::string::npos && sp + 4 <= len) {
-			if (std::isdigit((unsigned char)data[sp + 1]) && std::isdigit((unsigned char)data[sp + 2]) && std::isdigit((unsigned char)data[sp + 3])) {
-				code = (data[sp + 1] - '0') * 100 + (data[sp + 2] - '0') * 10 + (data[sp + 3] - '0');
+		// Parse status once
+		if (!sess->statusParsed) {
+			int code = 0;
+			const char* data = sess->readBuf.data();
+			size_t len = lineEnd;
+			size_t sp = sess->readBuf.find(' ');
+			if (sp != std::string::npos && sp + 4 <= len) {
+				if (std::isdigit((unsigned char)data[sp + 1]) && std::isdigit((unsigned char)data[sp + 2]) && std::isdigit((unsigned char)data[sp + 3])) {
+					code = (data[sp + 1] - '0') * 100 + (data[sp + 2] - '0') * 10 + (data[sp + 3] - '0');
+				}
 			}
+			sess->statusParsed = true;
+			sess->statusCode = code;
 		}
-		// Success criteria:
-		// - For CONNECT mode (HTTP proxy) expect 200 Connection established (some send 200 or 2xx/OK variants)
-		// - For direct HTTP HEAD expect 200
-		if (code >= 200 && code < 300) {
-			succeedSession(sess);
-			return;
+
+		// Handle based on state
+		switch (sess->state) {
+			case SessionState::HTTP_CONNECT_RECV: {
+				if (sess->statusCode >= 200 && sess->statusCode < 300) {
+					// If IP masking required and port 80, send GET within tunnel (origin-form)
+					if (sess->requireIpMasking && sess->worker->settings_.testPort == 80) {
+						sess->readBuf.clear();
+						sess->statusParsed = false;
+						sess->headersComplete = false;
+						sess->worker->prepareTunneledHttpGet(sess, sess->worker->settings_.testHost, sess->worker->settings_.testPort, sess->worker->settings_.testPath);
+						sess->state = SessionState::HTTP_TUNNEL_HTTP_SEND;
+						sess->worker->setDeadline(sess, sess->worker->settings_.requestTimeoutMs);
+						sess->worker->arm(sess, false, true);
+						return;
+					}
+					succeedSession(sess);
+					return;
+				}
+				failSession(sess);
+				return;
+			}
+			case SessionState::HTTP_RECV:
+			case SessionState::HTTP_TUNNEL_HTTP_RECV:
+			case SessionState::SOCKS_HTTP_RECV: {
+				if (!(sess->statusCode >= 200 && sess->statusCode < 300)) { failSession(sess); return; }
+				// For SOCKS HTTP verification, we do not require IP masking; treat 2xx as success
+				if (sess->state == SessionState::SOCKS_HTTP_RECV) { succeedSession(sess); return; }
+				// For HTTP direct or tunneled GET, if masking not required, success
+				if (!sess->requireIpMasking || sess->worker->settings_.clientPublicIP.empty()) { succeedSession(sess); return; }
+				// Need headers end to parse body
+				size_t hdrEnd = sess->readBuf.find("\r\n\r\n");
+				if (hdrEnd == std::string::npos) {
+					if (sess->readBuf.size() > (1u << 20)) { failSession(sess); }
+					return;
+				}
+				sess->headersComplete = true;
+				size_t bodyPos = hdrEnd + 4;
+				if (bodyPos >= sess->readBuf.size()) return; // wait for body
+				std::string ip;
+				if (extractFirstIPv4(sess->readBuf.data() + bodyPos, sess->readBuf.size() - bodyPos, ip)) {
+					if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
+						succeedSession(sess);
+						return;
+					}
+					// Found but equals our own IP => not a proxy masking -> fail
+					failSession(sess);
+					return;
+				}
+				// Keep reading until close or threshold
+				if (sess->readBuf.size() > 65536) { failSession(sess); }
+				return;
+			}
+			default:
+				break;
 		}
-		failSession(sess);
 	}
 
 	void parseSocks5Method(Session* sess) {
@@ -928,6 +1089,65 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		return false;
 	}
 	return true;
+}
+
+
+// Fetch the public IP of this machine by making a direct HTTP GET to testHost:testPort testPath
+// Only supports HTTP on port 80 (no TLS). Returns true on success and populates settings.clientPublicIP
+static bool fetchBaselinePublicIP(Settings& settings) {
+    if (settings.testPort != 80) return false;
+    const std::string& host = settings.testHost;
+    const std::string& path = settings.testPath.empty() ? std::string("/") : settings.testPath;
+    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC; hints.ai_flags = AI_ADDRCONFIG;
+    addrinfo* res = nullptr;
+    char portStr[16]; snprintf(portStr, sizeof(portStr), "%u", (unsigned)settings.testPort);
+    int gai = getaddrinfo(host.c_str(), portStr, &hints, &res);
+    if (gai != 0 || !res) {
+        return false;
+    }
+    int fd = -1; addrinfo* aiSel = nullptr;
+    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+        if (fd < 0) continue;
+        // Set short timeouts
+        struct timeval tv; tv.tv_sec = settings.connectTimeoutMs / 1000; tv.tv_usec = (settings.connectTimeoutMs % 1000) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) { aiSel = ai; break; }
+        close(fd); fd = -1;
+    }
+    if (fd < 0) { freeaddrinfo(res); return false; }
+    // Build simple origin-form GET
+    std::string req;
+    req.reserve(256);
+    req += "GET "; req += path.empty() ? "/" : path; req += " HTTP/1.1\r\n";
+    req += "Host: "; req += host; req += "\r\n";
+    req += "User-Agent: ProxyChecker/0.1\r\n";
+    req += "Accept: text/plain, text/*;q=0.9, */*;q=0.1\r\n";
+    req += "Connection: close\r\n\r\n";
+    ssize_t wn = ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
+    if (wn < 0) { close(fd); freeaddrinfo(res); return false; }
+    // Read response
+    std::string buf; buf.reserve(4096);
+    char tmp[2048];
+    while (true) {
+        ssize_t rn = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (rn <= 0) break;
+        buf.append(tmp, (size_t)rn);
+        if (buf.size() > (1u << 20)) break; // 1MB cap
+    }
+    close(fd); freeaddrinfo(res);
+    // Find body
+    size_t hdrEnd = buf.find("\r\n\r\n");
+    if (hdrEnd == std::string::npos) return false;
+    size_t bodyPos = hdrEnd + 4;
+    if (bodyPos >= buf.size()) return false;
+    std::string ip;
+    if (extractFirstIPv4FromBuffer(buf.data() + bodyPos, buf.size() - bodyPos, ip)) {
+        settings.clientPublicIP = ip;
+        return true;
+    }
+    return false;
 }
 
 
@@ -1259,6 +1479,11 @@ int main(int argc, char** argv) {
 			std::cerr << "No proxies generated from input file\n";
 			return 1;
 		}
+	}
+
+	// If HTTP on port 80, prefetch our public IP baseline once to enable IP-masking verification
+	if (settings.testPort == 80) {
+		(void)fetchBaselinePublicIP(settings);
 	}
 
 	// Number of workers
