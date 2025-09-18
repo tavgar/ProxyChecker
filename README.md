@@ -18,11 +18,17 @@ make -C ProxyChecker -j
 ## Usage
 
 ```bash
+# From a list file
 ./proxychecker --in proxies.txt --out good.txt \
   --workers 8 --concurrency 4096 \
   --test-host ifconfig.io --test-port 443 --test-path / \
   --timeout 2 \
   --default-proto http --http-mode connect
+
+# Scan an IP range in CIDR on common proxy ports
+./proxychecker --range 104.20.15.0/24 --out good_from_range.txt \
+  --workers 8 --concurrency 4096 \
+  --timeout 2
 ```
 
 Input file format:
@@ -31,6 +37,14 @@ Input file format:
 - Or `ip:port,proto`
 
 Output file contains one working proxy per line in `proto://ip:port` format.
+Range scanning:
+- Use `--range CIDR` (e.g., `10.0.0.0/24`) to enumerate all IPv4 addresses in the range
+  and test common proxy ports (80, 8080, 1080, 3128, 8888, 8000, 8081, 8082, 3129, 4145, 9999).
+- `--range` is mutually exclusive with `--in`.
+
+Real-time feedback:
+- Successful proxies are printed immediately, e.g., `Found: http://1.2.3.4:8080`.
+- A dynamic progress bar updates counts of checked, succeeded, and failed.
 
 Behavior when protocol is omitted:
 - If a line is `ip:port` without a protocol, the checker will try all supported protocols and HTTP methods for that endpoint in parallel:
