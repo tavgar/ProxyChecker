@@ -70,9 +70,9 @@ struct Settings {
 	std::string testPath = "/";
 	int numWorkers = std::max(1, (int)std::thread::hardware_concurrency());
 	int concurrencyPerWorker = 2048;
-	int connectTimeoutMs = 400; // short and aggressive
-	int handshakeTimeoutMs = 600;
-	int requestTimeoutMs = 900;
+	int connectTimeoutMs = 2000; // improved for proxy reliability
+	int handshakeTimeoutMs = 3000;
+	int requestTimeoutMs = 5000;
 	Protocol defaultProtocol = Protocol::HTTP;
 	bool mergeOutputs = true;
 	bool keepParts = false;
@@ -735,9 +735,9 @@ static void usage(const char* argv0) {
 	std::cerr << "  --test-host HOST      Target host for verification (default: example.com)\n";
 	std::cerr << "  --test-port PORT      Target port for verification (default: 443)\n";
 	std::cerr << "  --test-path PATH      HTTP path for verification (default: /)\n";
-	std::cerr << "  --connect-timeout MS  TCP connect timeout (default: 400)\n";
-	std::cerr << "  --handshake-timeout MS Handshake timeout (default: 600)\n";
-	std::cerr << "  --request-timeout MS  HTTP request timeout (default: 900)\n";
+	std::cerr << "  --connect-timeout MS  TCP connect timeout (default: 2000)\n";
+	std::cerr << "  --handshake-timeout MS Handshake timeout (default: 3000)\n";
+	std::cerr << "  --request-timeout MS  HTTP request timeout (default: 5000)\n";
 	std::cerr << "  --default-proto [http|socks4|socks5] (default: http)\n";
 	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
