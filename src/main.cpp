@@ -42,6 +42,11 @@ enum class Protocol : uint8_t {
 	SOCKS5 = 2,
 };
 
+enum class HttpMode : uint8_t {
+	CONNECT = 0,
+	DIRECT = 1,
+};
+
 static const char* protocolToString(Protocol p) {
 	switch (p) {
 		case Protocol::HTTP: return "http";
@@ -61,7 +66,7 @@ struct Settings {
 	std::string inputFile;
 	std::string outputFile; // final merged file
 	std::string testHost = "example.com"; // remote host to HTTP HEAD via proxies
-	uint16_t testPort = 80;
+	uint16_t testPort = 443;
 	std::string testPath = "/";
 	int numWorkers = std::max(1, (int)std::thread::hardware_concurrency());
 	int concurrencyPerWorker = 2048;
@@ -73,6 +78,7 @@ struct Settings {
 	bool keepParts = false;
 	bool quiet = false;
 	int maxOpenFiles = 262144; // attempt to raise
+	HttpMode httpMode = HttpMode::CONNECT;
 };
 
 static inline uint64_t nowMs() {
@@ -191,6 +197,8 @@ struct Counters {
 
 enum class SessionState : uint8_t {
 	CONNECTING = 0,
+	HTTP_CONNECT_SEND,
+	HTTP_CONNECT_RECV,
 	HTTP_SEND,
 	HTTP_RECV,
 	S5_METHOD_SEND,
@@ -455,7 +463,19 @@ private:
 			}
 			// Connected
 			switch (sess->proto) {
-				case Protocol::HTTP: prepareHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath); sess->state = SessionState::HTTP_SEND; setDeadline(sess, settings_.handshakeTimeoutMs); break;
+				case Protocol::HTTP: {
+					bool useConnect = (settings_.httpMode == HttpMode::CONNECT) || (settings_.testPort != 80);
+					if (useConnect) {
+						prepareHttpConnect(sess, settings_.testHost, settings_.testPort);
+						sess->state = SessionState::HTTP_CONNECT_SEND;
+						setDeadline(sess, settings_.handshakeTimeoutMs);
+					} else {
+						prepareHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+						sess->state = SessionState::HTTP_SEND;
+						setDeadline(sess, settings_.handshakeTimeoutMs);
+					}
+					break;
+				}
 				case Protocol::SOCKS5: prepareSocks5Method(sess); sess->state = SessionState::S5_METHOD_SEND; setDeadline(sess, settings_.handshakeTimeoutMs); break;
 				case Protocol::SOCKS4: prepareSocks4Connect(sess, settings_.testHost, settings_.testPort); sess->state = SessionState::S4_CONNECT_SEND; setDeadline(sess, settings_.handshakeTimeoutMs); break;
 			}
@@ -478,6 +498,7 @@ private:
 		if (sess->writeOffset >= sess->writeBuf.size()) {
 			// Move to expected read stage
 			switch (sess->state) {
+				case SessionState::HTTP_CONNECT_SEND: sess->state = SessionState::HTTP_CONNECT_RECV; setDeadline(sess, settings_.requestTimeoutMs); arm(sess, true, false); break;
 				case SessionState::HTTP_SEND: sess->state = SessionState::HTTP_RECV; setDeadline(sess, settings_.requestTimeoutMs); arm(sess, true, false); break;
 				case SessionState::S5_METHOD_SEND: sess->state = SessionState::S5_METHOD_RECV; arm(sess, true, false); break;
 				case SessionState::S5_CONNECT_SEND: sess->state = SessionState::S5_CONNECT_RECV; arm(sess, true, false); break;
@@ -500,6 +521,8 @@ private:
 		sess->readBuf.append(buf, (size_t)n);
 		// Parse based on state
 		switch (sess->state) {
+			case SessionState::HTTP_CONNECT_RECV: parseHttpStatus(sess);
+				break;
 			case SessionState::HTTP_RECV: parseHttpStatus(sess);
 				break;
 			case SessionState::S5_METHOD_RECV: parseSocks5Method(sess);
@@ -516,6 +539,18 @@ private:
 	}
 
 	// Protocol helpers
+	static void buildHttpConnect(std::string& out, const std::string& host, uint16_t port) {
+		out.clear();
+		std::string hostHeader = host + ":" + std::to_string(port);
+		out += "CONNECT ";
+		out += hostHeader;
+		out += " HTTP/1.1\r\n";
+		out += "Host: ";
+		out += hostHeader;
+		out += "\r\n";
+		out += "Proxy-Connection: keep-alive\r\n";
+		out += "Connection: keep-alive\r\n\r\n";
+	}
 	static void buildHttpHead(std::string& out, const std::string& host, uint16_t port, const std::string& path, bool absoluteForm) {
 		out.clear();
 		std::string hostHeader = host;
@@ -539,6 +574,12 @@ private:
 
 	void prepareHttpHead(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
 		buildHttpHead(sess->writeBuf, host, port, path, /*absoluteForm*/true);
+		sess->writeOffset = 0;
+		sess->readBuf.clear();
+	}
+
+	void prepareHttpConnect(Session* sess, const std::string& host, uint16_t port) {
+		buildHttpConnect(sess->writeBuf, host, port);
 		sess->writeOffset = 0;
 		sess->readBuf.clear();
 	}
@@ -619,7 +660,10 @@ private:
 				code = (data[sp + 1] - '0') * 100 + (data[sp + 2] - '0') * 10 + (data[sp + 3] - '0');
 			}
 		}
-		if (code == 200) {
+		// Success criteria:
+		// - For CONNECT mode (HTTP proxy) expect 200 Connection established (some send 200 or 2xx/OK variants)
+		// - For direct HTTP HEAD expect 200
+		if (code >= 200 && code < 300) {
 			succeedSession(sess);
 			return;
 		}
@@ -643,10 +687,15 @@ private:
 		unsigned char ver = (unsigned char)sess->readBuf[0];
 		unsigned char rep = (unsigned char)sess->readBuf[1];
 		if (ver != 5 || rep != 0x00) { failSession(sess); return; }
-		// Now send HTTP over the tunnel
-		prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
-		sess->state = SessionState::SOCKS_HTTP_SEND;
-		arm(sess, false, true);
+		// If testing port 80, we can do an HTTP HEAD over the tunnel for content check.
+		// For non-80 (e.g., 443), avoid sending plaintext HTTP; consider CONNECT success as pass.
+		if (settings_.testPort == 80) {
+			prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+			sess->state = SessionState::SOCKS_HTTP_SEND;
+			arm(sess, false, true);
+		} else {
+			succeedSession(sess);
+		}
 	}
 
 	void parseSocks4Connect(Session* sess) {
@@ -654,9 +703,13 @@ private:
 		unsigned char vn = (unsigned char)sess->readBuf[0];
 		unsigned char cd = (unsigned char)sess->readBuf[1];
 		if (vn != 0x00 || cd != 0x5A) { failSession(sess); return; }
-		prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
-		sess->state = SessionState::SOCKS_HTTP_SEND;
-		arm(sess, false, true);
+		if (settings_.testPort == 80) {
+			prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+			sess->state = SessionState::SOCKS_HTTP_SEND;
+			arm(sess, false, true);
+		} else {
+			succeedSession(sess);
+		}
 	}
 
 	std::vector<Session*> activeList_;
@@ -680,12 +733,13 @@ static void usage(const char* argv0) {
 	std::cerr << "  --workers N           Number of worker threads (default: hw cores)\n";
 	std::cerr << "  --concurrency N       Connections per worker (default: 2048)\n";
 	std::cerr << "  --test-host HOST      Target host for verification (default: example.com)\n";
-	std::cerr << "  --test-port PORT      Target port for verification (default: 80)\n";
+	std::cerr << "  --test-port PORT      Target port for verification (default: 443)\n";
 	std::cerr << "  --test-path PATH      HTTP path for verification (default: /)\n";
 	std::cerr << "  --connect-timeout MS  TCP connect timeout (default: 400)\n";
 	std::cerr << "  --handshake-timeout MS Handshake timeout (default: 600)\n";
 	std::cerr << "  --request-timeout MS  HTTP request timeout (default: 900)\n";
 	std::cerr << "  --default-proto [http|socks4|socks5] (default: http)\n";
+	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
 	std::cerr << "  --quiet               Reduce logging\n";
 	std::cerr << std::flush;
@@ -712,6 +766,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--handshake-timeout") { const char* v = need("--handshake-timeout"); if (!v) return false; s.handshakeTimeoutMs = std::max(1, atoi(v)); }
 		else if (a == "--request-timeout") { const char* v = need("--request-timeout"); if (!v) return false; s.requestTimeoutMs = std::max(1, atoi(v)); }
 		else if (a == "--default-proto") { const char* v = need("--default-proto"); if (!v) return false; std::string pv = v; if (pv == "http") s.defaultProtocol = Protocol::HTTP; else if (pv == "socks4") s.defaultProtocol = Protocol::SOCKS4; else if (pv == "socks5") s.defaultProtocol = Protocol::SOCKS5; else { std::cerr << "Unknown proto: " << pv << "\n"; return false; } }
+		else if (a == "--http-mode") { const char* v = need("--http-mode"); if (!v) return false; std::string hv = v; if (hv == "connect") s.httpMode = HttpMode::CONNECT; else if (hv == "direct") s.httpMode = HttpMode::DIRECT; else { std::cerr << "Unknown http mode: " << hv << "\n"; return false; } }
 		else if (a == "--no-merge") { s.mergeOutputs = false; }
 		else if (a == "--keep-parts") { s.keepParts = true; }
 		else if (a == "--quiet") { s.quiet = true; }

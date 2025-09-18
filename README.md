@@ -2,7 +2,9 @@
 
 A blazing-fast, epoll-based, multi-threaded proxy checker written in C++20.
 
-- Two-stage verification: fast handshake + full HTTP verification
+- Verification model:
+  - HTTP proxies: validate via HTTP CONNECT to the target (default: 443)
+  - SOCKS4/5: perform CONNECT to the target; if target is 80, send HTTP HEAD
 - Supports HTTP, SOCKS4, SOCKS5
 - Highly parallel with per-thread epoll and sharded inputs
 - Aggressive timeouts and socket tuning for speed
@@ -18,9 +20,9 @@ make -C ProxyChecker -j
 ```bash
 ./proxychecker --in proxies.txt --out good.txt \
   --workers 8 --concurrency 4096 \
-  --test-host example.com --test-port 80 --test-path / \
+  --test-host ifconfig.io --test-port 443 --test-path / \
   --connect-timeout 300 --handshake-timeout 500 --request-timeout 800 \
-  --default-proto http
+  --default-proto http --http-mode connect
 ```
 
 Input file format:
@@ -29,6 +31,10 @@ Input file format:
 - Or `ip:port,proto`
 
 Output file contains one working proxy per line in `proto://ip:port` format.
+
+Notes on correctness:
+- Plain web servers on port 80/443 may respond to raw HTTP, but are not proxies.
+- Using CONNECT to 443 avoids false positives by requiring proxy tunneling support.
 
 ## Notes
 
