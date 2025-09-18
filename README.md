@@ -32,6 +32,15 @@ Input file format:
 
 Output file contains one working proxy per line in `proto://ip:port` format.
 
+Behavior when protocol is omitted:
+- If a line is `ip:port` without a protocol, the checker will try all supported protocols and HTTP methods for that endpoint in parallel:
+  - HTTP CONNECT
+  - HTTP DIRECT (absolute-form HEAD request)
+  - SOCKS5 CONNECT
+  - SOCKS4 CONNECT
+- In this case, the `--default-proto` flag is ignored for that line.
+- If the input specifies protocol explicitly (`http://`, `socks4://`, `socks5://` or trailing `,proto`), only that protocol is attempted. For HTTP with explicit protocol, the HTTP mode is controlled by `--http-mode` (default `connect`).
+
 Notes on correctness:
 - Plain web servers on port 80/443 may respond to raw HTTP, but are not proxies.
 - Using CONNECT to 443 avoids false positives by requiring proxy tunneling support.
