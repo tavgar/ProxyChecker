@@ -23,6 +23,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -83,6 +84,8 @@ struct Settings {
 	bool quiet = false;
 	int maxOpenFiles = 262144; // attempt to raise
 	HttpMode httpMode = HttpMode::CONNECT;
+    // New: CIDR range scanning (mutually exclusive with --in)
+    std::string rangeCIDR;
 };
 
 static inline uint64_t nowMs() {
@@ -248,6 +251,8 @@ struct Session {
 	class Worker* worker{nullptr};
 };
 
+static std::mutex g_printMutex;
+
 class Worker {
 public:
 	Worker(int id,
@@ -292,7 +297,7 @@ private:
 			return;
 		}
 
-		counters_.total.fetch_add(proxies_.size(), std::memory_order_relaxed);
+		// total is set upfront in main
 
 		// Prime initial sessions
 		refill();
@@ -399,6 +404,10 @@ private:
 		counters_.succeeded.fetch_add(1, std::memory_order_relaxed);
 		if (out_.is_open()) {
 			out_ << protocolToString(sess->proto) << "://" << sess->proxyHost << ":" << sess->proxyPort << "\n";
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_printMutex);
+			std::cout << "Found: " << protocolToString(sess->proto) << "://" << sess->proxyHost << ":" << sess->proxyPort << std::endl;
 		}
 		sess->state = SessionState::DONE;
 		removeFromActive(sess);
@@ -744,9 +753,10 @@ static void raiseNoFileLimit(int target, bool quiet) {
 }
 
 static void usage(const char* argv0) {
-	std::cerr << "Usage: " << argv0 << " --in proxies.txt --out good.txt [options]\n";
+	std::cerr << "Usage: " << argv0 << " (--in proxies.txt | --range CIDR) --out good.txt [options]\n";
 	std::cerr << "Options:\n";
 	std::cerr << "  --in FILE             Input file of proxies (ip:port or proto://ip:port)\n";
+	std::cerr << "  --range CIDR          Scan IP range in CIDR (e.g., 104.20.15.0/24) on common proxy ports\n";
 	std::cerr << "  --out FILE            Output file for working proxies\n";
 	std::cerr << "  --workers N           Number of worker threads (default: hw cores)\n";
 	std::cerr << "  --concurrency N       Connections per worker (default: 2048)\n";
@@ -764,6 +774,7 @@ static void usage(const char* argv0) {
 	    std::cerr << "    the checker tries all supported protocols/modes: HTTP CONNECT, HTTP DIRECT, SOCKS4, SOCKS5.\n";
 	    std::cerr << "  - If --default-proto is provided, unspecified lines are tested ONLY with that protocol\n";
 	    std::cerr << "    (HTTP uses --http-mode). Lines that explicitly specify a protocol are honored as-is.\n";
+	    std::cerr << "  - --range and --in are mutually exclusive.\n";
 	std::cerr << std::flush;
 }
 
@@ -778,6 +789,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 			return argv[++i];
 		};
 		if (a == "--in") { const char* v = need("--in"); if (!v) return false; s.inputFile = v; }
+		else if (a == "--range") { const char* v = need("--range"); if (!v) return false; s.rangeCIDR = v; }
 		else if (a == "--out") { const char* v = need("--out"); if (!v) return false; s.outputFile = v; }
 		else if (a == "--workers") { const char* v = need("--workers"); if (!v) return false; s.numWorkers = std::max(1, atoi(v)); }
 		else if (a == "--concurrency") { const char* v = need("--concurrency"); if (!v) return false; s.concurrencyPerWorker = std::max(1, atoi(v)); }
@@ -803,7 +815,15 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
 	}
-	if (s.inputFile.empty()) { std::cerr << "--in is required\n"; return false; }
+	// Validate exclusivity and presence
+	if (!s.inputFile.empty() && !s.rangeCIDR.empty()) {
+		std::cerr << "--in and --range are mutually exclusive\n";
+		return false;
+	}
+	if (s.inputFile.empty() && s.rangeCIDR.empty()) {
+		std::cerr << "Either --in or --range must be provided\n";
+		return false;
+	}
 	return true;
 }
 
@@ -846,6 +866,121 @@ static bool readProxies(const std::string& path, const Settings& s, std::vector<
 	return true;
 }
 
+// Common proxy ports for range scanning
+static const uint16_t kCommonProxyPorts[] = {
+    80, 8080, 1080, 3128, 8888, 8000, 8081, 8082, 3129, 4145, 9999
+};
+
+static bool parseCIDR(const std::string& cidr, uint32_t& network, uint32_t& maskBits) {
+    size_t slash = cidr.find('/');
+    if (slash == std::string::npos) return false;
+    std::string ipStr = cidr.substr(0, slash);
+    std::string maskStr = cidr.substr(slash + 1);
+    if (maskStr.empty()) return false;
+    char* end = nullptr;
+    long m = strtol(maskStr.c_str(), &end, 10);
+    if (!end || *end != '\0' || m < 0 || m > 32) return false;
+    maskBits = (uint32_t)m;
+    in_addr addr{};
+    if (inet_pton(AF_INET, ipStr.c_str(), &addr) != 1) return false;
+    network = ntohl(addr.s_addr);
+    // Ensure network is aligned to mask
+    uint32_t mask = maskBits == 0 ? 0 : (0xFFFFFFFFu << (32 - maskBits));
+    network &= mask;
+    return true;
+}
+
+static void enumerateIPsInCIDR(uint32_t network, uint32_t maskBits, std::vector<std::string>& outIPs) {
+    uint32_t mask = maskBits == 0 ? 0 : (0xFFFFFFFFu << (32 - maskBits));
+    uint32_t start = network; // already masked
+    uint32_t end = start | (~mask);
+    outIPs.reserve(outIPs.size() + (size_t)(end - start + 1));
+    char buf[INET_ADDRSTRLEN];
+    for (uint32_t ip = start; ip <= end; ++ip) {
+        in_addr a{};
+        a.s_addr = htonl(ip);
+        if (inet_ntop(AF_INET, &a, buf, sizeof(buf))) {
+            outIPs.emplace_back(buf);
+        }
+        if (ip == 0xFFFFFFFFu) break; // guard overflow when maskBits==0
+    }
+}
+
+static bool generateProxiesFromRange(const Settings& s, std::vector<ProxyTarget>& out) {
+    uint32_t network = 0, maskBits = 0;
+    if (!parseCIDR(s.rangeCIDR, network, maskBits)) {
+        std::cerr << "Invalid CIDR: " << s.rangeCIDR << "\n";
+        return false;
+    }
+    std::vector<std::string> ips;
+    enumerateIPsInCIDR(network, maskBits, ips);
+    if (ips.empty()) return true;
+    for (const std::string& ip : ips) {
+        for (uint16_t port : kCommonProxyPorts) {
+            if (s.defaultProtocolForced) {
+                switch (s.defaultProtocol) {
+                    case Protocol::HTTP:
+                        out.push_back(ProxyTarget{Protocol::HTTP, ip, port, s.httpMode});
+                        break;
+                    case Protocol::SOCKS5:
+                        out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
+                        break;
+                    case Protocol::SOCKS4:
+                        out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
+                        break;
+                }
+            } else {
+                out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::CONNECT});
+                out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::DIRECT});
+                out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
+                out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
+            }
+        }
+    }
+    return true;
+}
+
+static void buildProgressBar(uint64_t current, uint64_t total, int width, std::string& out) {
+    out.clear();
+    double ratio = (total == 0) ? 0.0 : (double)current / (double)total;
+    if (ratio < 0.0) ratio = 0.0; if (ratio > 1.0) ratio = 1.0;
+    int filled = (int)(ratio * width + 0.5);
+    out.push_back('[');
+    for (int i = 0; i < width; ++i) {
+        out += (i < filled) ? "\xE2\x96\x88" /*█*/ : "\xE2\x96\x91" /*░*/;
+    }
+    out.push_back(']');
+}
+
+static void progressLoop(const Settings& s, const Counters& counters, std::atomic<bool>& stopFlag) {
+    if (s.quiet) return;
+    std::string bar;
+    while (!stopFlag.load(std::memory_order_relaxed)) {
+        uint64_t total = counters.total.load(std::memory_order_relaxed);
+        uint64_t started = counters.started.load(std::memory_order_relaxed);
+        uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
+        uint64_t bad = counters.failed.load(std::memory_order_relaxed);
+        uint64_t checked = ok + bad; // sessions that completed
+        uint64_t current = (started < total) ? started : total;
+        buildProgressBar(current, total, 28, bar);
+        double pct = (total == 0) ? 0.0 : (double)current * 100.0 / (double)total;
+        fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
+                bar.c_str(), pct, checked, total, ok, bad);
+        fflush(stderr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    // Final line
+    uint64_t total = counters.total.load(std::memory_order_relaxed);
+    uint64_t started = counters.started.load(std::memory_order_relaxed);
+    uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
+    uint64_t bad = counters.failed.load(std::memory_order_relaxed);
+    uint64_t checked = ok + bad;
+    buildProgressBar(total, total, 28, bar);
+    fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
+            bar.c_str(), 100.0, checked, total, ok, bad);
+    fflush(stderr);
+}
+
 } // end anonymous namespace
 
 int main(int argc, char** argv) {
@@ -860,12 +995,18 @@ int main(int argc, char** argv) {
 	raiseNoFileLimit(settings.maxOpenFiles, settings.quiet);
 
 	std::vector<ProxyTarget> all;
-	if (!readProxies(settings.inputFile, settings, all)) {
-		std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
-		return 1;
+	if (!settings.rangeCIDR.empty()) {
+		if (!generateProxiesFromRange(settings, all)) {
+			return 1;
+		}
+	} else {
+		if (!readProxies(settings.inputFile, settings, all)) {
+			std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
+			return 1;
+		}
 	}
 	if (all.empty()) {
-		std::cerr << "No proxies found in input\n";
+		std::cerr << "No proxies generated from input/range\n";
 		return 1;
 	}
 
@@ -877,6 +1018,12 @@ int main(int argc, char** argv) {
 	}
 
 	Counters counters;
+	counters.total.store((uint64_t)all.size(), std::memory_order_relaxed);
+	std::atomic<bool> progressStop{false};
+	std::thread progressThread;
+	if (!settings.quiet) {
+		progressThread = std::thread(progressLoop, settings, std::cref(counters), std::ref(progressStop));
+	}
 	std::vector<std::unique_ptr<Worker>> workerObjs;
 	workerObjs.reserve((size_t)workers);
 	for (int i = 0; i < workers; ++i) {
@@ -886,6 +1033,8 @@ int main(int argc, char** argv) {
 	logf(settings.quiet, "Starting %d workers, total proxies: %" PRIu64, workers, totalWork);
 	for (auto& w : workerObjs) w->start();
 	for (auto& w : workerObjs) w->join();
+	progressStop.store(true, std::memory_order_relaxed);
+	if (progressThread.joinable()) progressThread.join();
 
 	logf(settings.quiet, "Done. Succeeded=%" PRIu64 ", Failed=%" PRIu64, counters.succeeded.load(), counters.failed.load());
 
