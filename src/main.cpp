@@ -77,6 +77,7 @@ struct Settings {
 	int handshakeTimeoutMs = 3000;
 	int requestTimeoutMs = 5000;
 	Protocol defaultProtocol = Protocol::HTTP;
+	bool defaultProtocolForced = false; // true if --default-proto explicitly provided
 	bool mergeOutputs = true;
 	bool keepParts = false;
 	bool quiet = false;
@@ -752,6 +753,7 @@ static void usage(const char* argv0) {
 	std::cerr << "  --test-host HOST      Target host for verification (default: example.com)\n";
 	std::cerr << "  --test-port PORT      Target port for verification (default: 443)\n";
 	std::cerr << "  --test-path PATH      HTTP path for verification (default: /)\n";
+	std::cerr << "  --timeout MS          Set connect/handshake/request timeouts to the same value\n";
 	std::cerr << "  --connect-timeout MS  TCP connect timeout (default: 2000)\n";
 	std::cerr << "  --handshake-timeout MS Handshake timeout (default: 3000)\n";
 	std::cerr << "  --request-timeout MS  HTTP request timeout (default: 5000)\n";
@@ -759,10 +761,12 @@ static void usage(const char* argv0) {
 	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
 	std::cerr << "  --quiet               Reduce logging\n";
-    std::cerr << "\n";
-    std::cerr << "Notes:\n";
-    std::cerr << "  - If a line omits protocol (e.g., ip:port), the checker tries http (CONNECT and DIRECT), socks4, and socks5.\n";
-    std::cerr << "  - In that case, --default-proto is ignored.\n";
+	    std::cerr << "\n";
+	    std::cerr << "Notes:\n";
+	    std::cerr << "  - If a line omits protocol (e.g., ip:port) and --default-proto is NOT provided,\n";
+	    std::cerr << "    the checker tries all supported protocols/modes: HTTP CONNECT, HTTP DIRECT, SOCKS4, SOCKS5.\n";
+	    std::cerr << "  - If --default-proto is provided, unspecified lines are tested ONLY with that protocol\n";
+	    std::cerr << "    (HTTP uses --http-mode). Lines that explicitly specify a protocol are honored as-is.\n";
 	std::cerr << std::flush;
 }
 
@@ -783,10 +787,11 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--test-host") { const char* v = need("--test-host"); if (!v) return false; s.testHost = v; }
 		else if (a == "--test-port") { const char* v = need("--test-port"); if (!v) return false; s.testPort = (uint16_t)atoi(v); }
 		else if (a == "--test-path") { const char* v = need("--test-path"); if (!v) return false; s.testPath = v; }
+		else if (a == "--timeout") { const char* v = need("--timeout"); if (!v) return false; int t = std::max(1, atoi(v)); s.connectTimeoutMs = t; s.handshakeTimeoutMs = t; s.requestTimeoutMs = t; }
 		else if (a == "--connect-timeout") { const char* v = need("--connect-timeout"); if (!v) return false; s.connectTimeoutMs = std::max(1, atoi(v)); }
 		else if (a == "--handshake-timeout") { const char* v = need("--handshake-timeout"); if (!v) return false; s.handshakeTimeoutMs = std::max(1, atoi(v)); }
 		else if (a == "--request-timeout") { const char* v = need("--request-timeout"); if (!v) return false; s.requestTimeoutMs = std::max(1, atoi(v)); }
-		else if (a == "--default-proto") { const char* v = need("--default-proto"); if (!v) return false; std::string pv = v; if (pv == "http") s.defaultProtocol = Protocol::HTTP; else if (pv == "socks4") s.defaultProtocol = Protocol::SOCKS4; else if (pv == "socks5") s.defaultProtocol = Protocol::SOCKS5; else { std::cerr << "Unknown proto: " << pv << "\n"; return false; } }
+		else if (a == "--default-proto") { const char* v = need("--default-proto"); if (!v) return false; std::string pv = v; if (pv == "http") s.defaultProtocol = Protocol::HTTP; else if (pv == "socks4") s.defaultProtocol = Protocol::SOCKS4; else if (pv == "socks5") s.defaultProtocol = Protocol::SOCKS5; else { std::cerr << "Unknown proto: " << pv << "\n"; return false; } s.defaultProtocolForced = true; }
 		else if (a == "--http-mode") { const char* v = need("--http-mode"); if (!v) return false; std::string hv = v; if (hv == "connect") s.httpMode = HttpMode::CONNECT; else if (hv == "direct") s.httpMode = HttpMode::DIRECT; else { std::cerr << "Unknown http mode: " << hv << "\n"; return false; } }
 		else if (a == "--no-merge") { s.mergeOutputs = false; }
 		else if (a == "--keep-parts") { s.keepParts = true; }
@@ -798,23 +803,41 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 	return true;
 }
 
-static bool readProxies(const std::string& path, Protocol defaultProto, std::vector<ProxyTarget>& out) {
+
+static bool readProxies(const std::string& path, const Settings& s, std::vector<ProxyTarget>& out) {
 	std::ifstream in(path);
 	if (!in.is_open()) return false;
 	std::string line;
 	while (std::getline(in, line)) {
-        auto v = parseProxyLineDetailed(line, defaultProto);
+		auto v = parseProxyLineDetailed(line, s.defaultProtocol);
         if (!v) continue;
         const ParsedProxyLine& pl = *v;
-        if (pl.explicitProto) {
-            out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
-        } else {
-            // Expand unspecified protocol to try all protocols and HTTP modes
-            out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT});
-            out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::DIRECT});
-            out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
-            out.push_back(ProxyTarget{Protocol::SOCKS4, pl.host, pl.port, std::nullopt});
-        }
+		if (pl.explicitProto) {
+			// Honor explicit protocol lines as-is
+			out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
+		} else {
+			// Protocol omitted in input
+			if (s.defaultProtocolForced) {
+				// Enforce the specified default protocol only
+				switch (s.defaultProtocol) {
+					case Protocol::HTTP:
+						out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, s.httpMode});
+						break;
+					case Protocol::SOCKS5:
+						out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
+						break;
+					case Protocol::SOCKS4:
+						out.push_back(ProxyTarget{Protocol::SOCKS4, pl.host, pl.port, std::nullopt});
+						break;
+				}
+			} else {
+				// Try all protocols and HTTP modes by default
+				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT});
+				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::DIRECT});
+				out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
+				out.push_back(ProxyTarget{Protocol::SOCKS4, pl.host, pl.port, std::nullopt});
+			}
+		}
 	}
 	return true;
 }
@@ -833,7 +856,7 @@ int main(int argc, char** argv) {
 	raiseNoFileLimit(settings.maxOpenFiles, settings.quiet);
 
 	std::vector<ProxyTarget> all;
-	if (!readProxies(settings.inputFile, settings.defaultProtocol, all)) {
+	if (!readProxies(settings.inputFile, settings, all)) {
 		std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
 		return 1;
 	}
