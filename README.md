@@ -29,6 +29,17 @@ make -C ProxyChecker -j
 ./proxychecker --range 104.20.15.0/24 --out good_from_range.txt \
   --workers 8 --concurrency 4096 \
   --timeout 2
+
+# Scan multiple CIDR ranges from a file
+# range_list.txt (example):
+# 104.28.234.240/30
+# 104.28.234.244/32
+# 104.28.246.42/31
+# 109.224.208.0/21
+# 109.238.144.0/20
+./proxychecker --range-file range_list.txt --out good_from_ranges.txt \
+  --workers 8 --concurrency 4096 \
+  --timeout 2
 ```
 
 Input file format:
@@ -40,7 +51,8 @@ Output file contains one working proxy per line in `proto://ip:port` format.
 Range scanning:
 - Use `--range CIDR` (e.g., `10.0.0.0/24`) to enumerate all IPv4 addresses in the range
   and test common proxy ports (80, 8080, 1080, 3128, 8888, 8000, 8081, 8082, 3129, 4145, 9999).
-- `--range` is mutually exclusive with `--in`.
+- Use `--range-file FILE` to provide multiple CIDR ranges, one per line.
+- `--in`, `--range`, and `--range-file` are mutually exclusive.
 
 Real-time feedback:
 - Successful proxies are printed immediately, e.g., `Found: http://1.2.3.4:8080`.
