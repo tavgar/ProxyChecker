@@ -92,6 +92,11 @@ struct Settings {
     bool ipProgressMode{false};
     uint64_t totalIpsForProgress{0};
     uint32_t sessionsPerIpForProgress{0};
+	    // New: when enabled, scan all ports (1-65535) for each IP in range modes
+	    bool scanAllPorts{false};
+	    // Progress helpers for scan-all-ports mode
+	    uint64_t totalPortsForProgress{0};
+	    uint32_t sessionsPerPortForProgress{0};
 };
 
 static inline uint64_t nowMs() {
@@ -762,7 +767,7 @@ static void usage(const char* argv0) {
 	std::cerr << "Usage: " << argv0 << " (--in proxies.txt | --range CIDR | --range-file FILE) --out good.txt [options]\n";
 	std::cerr << "Options:\n";
 	std::cerr << "  --in FILE             Input file of proxies (ip:port or proto://ip:port)\n";
-	std::cerr << "  --range CIDR          Scan IP range in CIDR (e.g., 104.20.15.0/24) on common proxy ports\n";
+    std::cerr << "  --range CIDR          Scan IP range in CIDR (e.g., 104.20.15.0/24) on common proxy ports (or all ports with --scan-all-ports)\n";
 	std::cerr << "  --range-file FILE     Scan multiple CIDR ranges listed in FILE (one per line)\n";
 	std::cerr << "  --out FILE            Output file for working proxies\n";
 	std::cerr << "  --workers N           Number of worker threads (default: hw cores)\n";
@@ -775,6 +780,7 @@ static void usage(const char* argv0) {
 	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
 	std::cerr << "  --quiet               Reduce logging\n";
+	std::cerr << "  --scan-all-ports      Scan all ports (1-65535) for each IP in range modes\n";
 	    std::cerr << "\n";
 	    std::cerr << "Notes:\n";
 	    std::cerr << "  - If a line omits protocol (e.g., ip:port) and --default-proto is NOT provided,\n";
@@ -820,6 +826,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--no-merge") { s.mergeOutputs = false; }
 		else if (a == "--keep-parts") { s.keepParts = true; }
 		else if (a == "--quiet") { s.quiet = true; }
+		else if (a == "--scan-all-ports") { s.scanAllPorts = true; }
 		else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
 	}
@@ -927,25 +934,34 @@ static bool generateProxiesFromRange(const Settings& s, std::vector<ProxyTarget>
     std::vector<std::string> ips;
     enumerateIPsInCIDR(network, maskBits, ips);
     if (ips.empty()) return true;
+    auto pushForPort = [&](const std::string& ip, uint16_t port){
+        if (s.defaultProtocolForced) {
+            switch (s.defaultProtocol) {
+                case Protocol::HTTP:
+                    out.push_back(ProxyTarget{Protocol::HTTP, ip, port, s.httpMode});
+                    break;
+                case Protocol::SOCKS5:
+                    out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
+                    break;
+                case Protocol::SOCKS4:
+                    out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
+                    break;
+            }
+        } else {
+            out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::CONNECT});
+            out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::DIRECT});
+            out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
+            out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
+        }
+    };
     for (const std::string& ip : ips) {
-        for (uint16_t port : kCommonProxyPorts) {
-            if (s.defaultProtocolForced) {
-                switch (s.defaultProtocol) {
-                    case Protocol::HTTP:
-                        out.push_back(ProxyTarget{Protocol::HTTP, ip, port, s.httpMode});
-                        break;
-                    case Protocol::SOCKS5:
-                        out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
-                        break;
-                    case Protocol::SOCKS4:
-                        out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
-                        break;
-                }
-            } else {
-                out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::CONNECT});
-                out.push_back(ProxyTarget{Protocol::HTTP, ip, port, HttpMode::DIRECT});
-                out.push_back(ProxyTarget{Protocol::SOCKS5, ip, port, std::nullopt});
-                out.push_back(ProxyTarget{Protocol::SOCKS4, ip, port, std::nullopt});
+        if (s.scanAllPorts) {
+            for (uint32_t p = 1; p <= 65535u; ++p) {
+                pushForPort(ip, (uint16_t)p);
+            }
+        } else {
+            for (uint16_t port : kCommonProxyPorts) {
+                pushForPort(ip, port);
             }
         }
     }
@@ -971,7 +987,7 @@ static void generateProxiesFromCIDR(uint32_t network, uint32_t maskBits, const S
             continue;
         }
         const std::string ipStr(buf);
-        for (uint16_t port : kCommonProxyPorts) {
+        auto pushForPort = [&](uint16_t port){
             if (s.defaultProtocolForced) {
                 switch (s.defaultProtocol) {
                     case Protocol::HTTP:
@@ -990,6 +1006,11 @@ static void generateProxiesFromCIDR(uint32_t network, uint32_t maskBits, const S
                 out.push_back(ProxyTarget{Protocol::SOCKS5, ipStr, port, std::nullopt});
                 out.push_back(ProxyTarget{Protocol::SOCKS4, ipStr, port, std::nullopt});
             }
+        };
+        if (s.scanAllPorts) {
+            for (uint32_t p = 1; p <= 65535u; ++p) pushForPort((uint16_t)p);
+        } else {
+            for (uint16_t port : kCommonProxyPorts) pushForPort(port);
         }
         if (ip == 0xFFFFFFFFu) break; // guard overflow when maskBits==0
     }
@@ -1041,7 +1062,14 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
         uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
         uint64_t bad = counters.failed.load(std::memory_order_relaxed);
         uint64_t checked = ok + bad; // sessions that completed
-        if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
+        if (s.scanAllPorts && s.totalPortsForProgress > 0 && s.sessionsPerPortForProgress > 0) {
+            uint64_t portUnitsDone = checked / (uint64_t)s.sessionsPerPortForProgress;
+            if (portUnitsDone > s.totalPortsForProgress) portUnitsDone = s.totalPortsForProgress;
+            buildProgressBar(portUnitsDone, s.totalPortsForProgress, 28, bar);
+            double pct = (s.totalPortsForProgress == 0) ? 0.0 : (double)portUnitsDone * 100.0 / (double)s.totalPortsForProgress;
+            fprintf(stderr, "\r%s %5.1f%% | Ports: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
+                    bar.c_str(), pct, portUnitsDone, s.totalPortsForProgress, ok, bad);
+        } else if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
             uint64_t ipUnitsDone = checked / (uint64_t)s.sessionsPerIpForProgress;
             if (ipUnitsDone > s.totalIpsForProgress) ipUnitsDone = s.totalIpsForProgress;
             buildProgressBar(ipUnitsDone, s.totalIpsForProgress, 28, bar);
@@ -1064,7 +1092,11 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
     uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
     uint64_t bad = counters.failed.load(std::memory_order_relaxed);
     uint64_t checked = ok + bad;
-    if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
+    if (s.scanAllPorts && s.totalPortsForProgress > 0 && s.sessionsPerPortForProgress > 0) {
+        buildProgressBar(s.totalPortsForProgress, s.totalPortsForProgress, 28, bar);
+        fprintf(stderr, "\r%s %5.1f%% | Ports: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
+                bar.c_str(), 100.0, s.totalPortsForProgress, s.totalPortsForProgress, ok, bad);
+    } else if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
         buildProgressBar(s.totalIpsForProgress, s.totalIpsForProgress, 28, bar);
         fprintf(stderr, "\r%s %5.1f%% | IPs: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
                 bar.c_str(), 100.0, s.totalIpsForProgress, s.totalIpsForProgress, ok, bad);
@@ -1097,14 +1129,25 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		settings.totalIpsForProgress = totalIps;
-		// One IP yields N targets depending on protocol assumptions
-		uint64_t sessionsPerIp = 0;
-		if (!all.empty() && totalIps > 0) {
-			// approximate: total sessions divided by IPs
-			sessionsPerIp = (uint64_t)all.size() / totalIps;
-			if (sessionsPerIp == 0) sessionsPerIp = 1;
+		// Compute progress units
+		if (settings.scanAllPorts) {
+			settings.totalPortsForProgress = totalIps * 65535ULL;
+			uint64_t sessionsPerPort = 0;
+			if (!all.empty() && settings.totalPortsForProgress > 0) {
+				sessionsPerPort = (uint64_t)all.size() / settings.totalPortsForProgress;
+				if (sessionsPerPort == 0) sessionsPerPort = 1;
+			}
+			settings.sessionsPerPortForProgress = (uint32_t)sessionsPerPort;
+		} else {
+			// One IP yields N targets depending on protocol assumptions
+			uint64_t sessionsPerIp = 0;
+			if (!all.empty() && totalIps > 0) {
+				// approximate: total sessions divided by IPs
+				sessionsPerIp = (uint64_t)all.size() / totalIps;
+				if (sessionsPerIp == 0) sessionsPerIp = 1;
+			}
+			settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
 		}
-		settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
 	} else if (!settings.rangeCIDR.empty()) {
 		settings.ipProgressMode = true;
 		uint32_t network=0, bits=0;
@@ -1116,12 +1159,22 @@ int main(int argc, char** argv) {
 		if (!generateProxiesFromRange(settings, all)) {
 			return 1;
 		}
-		uint64_t sessionsPerIp = 0;
-		if (!all.empty() && settings.totalIpsForProgress > 0) {
-			sessionsPerIp = (uint64_t)all.size() / settings.totalIpsForProgress;
-			if (sessionsPerIp == 0) sessionsPerIp = 1;
+		if (settings.scanAllPorts) {
+			settings.totalPortsForProgress = settings.totalIpsForProgress * 65535ULL;
+			uint64_t sessionsPerPort = 0;
+			if (!all.empty() && settings.totalPortsForProgress > 0) {
+				sessionsPerPort = (uint64_t)all.size() / settings.totalPortsForProgress;
+				if (sessionsPerPort == 0) sessionsPerPort = 1;
+			}
+			settings.sessionsPerPortForProgress = (uint32_t)sessionsPerPort;
+		} else {
+			uint64_t sessionsPerIp = 0;
+			if (!all.empty() && settings.totalIpsForProgress > 0) {
+				sessionsPerIp = (uint64_t)all.size() / settings.totalIpsForProgress;
+				if (sessionsPerIp == 0) sessionsPerIp = 1;
+			}
+			settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
 		}
-		settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
 	} else {
 		if (!readProxies(settings.inputFile, settings, all)) {
 			std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
@@ -1141,7 +1194,10 @@ int main(int argc, char** argv) {
 	}
 
 	Counters counters;
-	if (settings.ipProgressMode && settings.totalIpsForProgress > 0 && settings.sessionsPerIpForProgress > 0) {
+	if (settings.scanAllPorts && settings.ipProgressMode && settings.totalPortsForProgress > 0 && settings.sessionsPerPortForProgress > 0) {
+		// total represents sessions to start, but for progress we want to show per-Port (across IPs) progress
+		counters.total.store((uint64_t)settings.totalPortsForProgress * (uint64_t)settings.sessionsPerPortForProgress, std::memory_order_relaxed);
+	} else if (settings.ipProgressMode && settings.totalIpsForProgress > 0 && settings.sessionsPerIpForProgress > 0) {
 		// total represents sessions to start, but for progress we want to show per-IP progress
 		counters.total.store((uint64_t)settings.totalIpsForProgress * (uint64_t)settings.sessionsPerIpForProgress, std::memory_order_relaxed);
 	} else {
