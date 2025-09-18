@@ -47,6 +47,14 @@ make -C ProxyChecker -j
 
 # Example: scan ranges from a file across all ports with custom worker/concurrency
 ./proxychecker --range-file 212.txt --scan-all-ports --workers 12 --concurrency 50000 --timeout 5 --out good_full_scan_from_file.txt
+
+## Streaming generation for range scans
+
+When using `--range` or `--range-file`, tasks are generated on-the-fly and fed through a bounded queue to worker threads. This avoids preallocating every IP/port/protocol combination in memory.
+
+- By default, the queue capacity is `workers * concurrency * 2`. You can override with `--queue-size N`.
+- Progress is shown by IPs or Ports depending on whether `--scan-all-ports` is used.
+- This design prevents memory explosions when scanning large ranges or all ports (1..65535).
 ```
 
 Input file format:
