@@ -86,6 +86,12 @@ struct Settings {
 	HttpMode httpMode = HttpMode::CONNECT;
     // New: CIDR range scanning (mutually exclusive with --in)
     std::string rangeCIDR;
+    // New: multiple CIDR ranges from file (mutually exclusive with --in/--range)
+    std::string rangeFile;
+    // Progress customization for range/range-file: show per-IP totals
+    bool ipProgressMode{false};
+    uint64_t totalIpsForProgress{0};
+    uint32_t sessionsPerIpForProgress{0};
 };
 
 static inline uint64_t nowMs() {
@@ -753,10 +759,11 @@ static void raiseNoFileLimit(int target, bool quiet) {
 }
 
 static void usage(const char* argv0) {
-	std::cerr << "Usage: " << argv0 << " (--in proxies.txt | --range CIDR) --out good.txt [options]\n";
+	std::cerr << "Usage: " << argv0 << " (--in proxies.txt | --range CIDR | --range-file FILE) --out good.txt [options]\n";
 	std::cerr << "Options:\n";
 	std::cerr << "  --in FILE             Input file of proxies (ip:port or proto://ip:port)\n";
 	std::cerr << "  --range CIDR          Scan IP range in CIDR (e.g., 104.20.15.0/24) on common proxy ports\n";
+	std::cerr << "  --range-file FILE     Scan multiple CIDR ranges listed in FILE (one per line)\n";
 	std::cerr << "  --out FILE            Output file for working proxies\n";
 	std::cerr << "  --workers N           Number of worker threads (default: hw cores)\n";
 	std::cerr << "  --concurrency N       Connections per worker (default: 2048)\n";
@@ -774,7 +781,7 @@ static void usage(const char* argv0) {
 	    std::cerr << "    the checker tries all supported protocols/modes: HTTP CONNECT, HTTP DIRECT, SOCKS4, SOCKS5.\n";
 	    std::cerr << "  - If --default-proto is provided, unspecified lines are tested ONLY with that protocol\n";
 	    std::cerr << "    (HTTP uses --http-mode). Lines that explicitly specify a protocol are honored as-is.\n";
-	    std::cerr << "  - --range and --in are mutually exclusive.\n";
+	    std::cerr << "  - --in, --range, and --range-file are mutually exclusive.\n";
 	std::cerr << std::flush;
 }
 
@@ -790,6 +797,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		};
 		if (a == "--in") { const char* v = need("--in"); if (!v) return false; s.inputFile = v; }
 		else if (a == "--range") { const char* v = need("--range"); if (!v) return false; s.rangeCIDR = v; }
+		else if (a == "--range-file") { const char* v = need("--range-file"); if (!v) return false; s.rangeFile = v; }
 		else if (a == "--out") { const char* v = need("--out"); if (!v) return false; s.outputFile = v; }
 		else if (a == "--workers") { const char* v = need("--workers"); if (!v) return false; s.numWorkers = std::max(1, atoi(v)); }
 		else if (a == "--concurrency") { const char* v = need("--concurrency"); if (!v) return false; s.concurrencyPerWorker = std::max(1, atoi(v)); }
@@ -816,12 +824,16 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
 	}
 	// Validate exclusivity and presence
-	if (!s.inputFile.empty() && !s.rangeCIDR.empty()) {
-		std::cerr << "--in and --range are mutually exclusive\n";
+	int provided = 0;
+	if (!s.inputFile.empty()) ++provided;
+	if (!s.rangeCIDR.empty()) ++provided;
+	if (!s.rangeFile.empty()) ++provided;
+	if (provided > 1) {
+		std::cerr << "--in, --range, and --range-file are mutually exclusive\n";
 		return false;
 	}
-	if (s.inputFile.empty() && s.rangeCIDR.empty()) {
-		std::cerr << "Either --in or --range must be provided\n";
+	if (provided == 0) {
+		std::cerr << "One of --in, --range, or --range-file must be provided\n";
 		return false;
 	}
 	return true;
@@ -940,6 +952,74 @@ static bool generateProxiesFromRange(const Settings& s, std::vector<ProxyTarget>
     return true;
 }
 
+static inline uint64_t countIPsInCIDR(uint32_t maskBits) {
+    if (maskBits > 32) return 0ULL;
+    uint32_t hostBits = 32 - maskBits;
+    return (hostBits >= 32) ? (1ULL << 32) : (1ULL << hostBits);
+}
+
+static void generateProxiesFromCIDR(uint32_t network, uint32_t maskBits, const Settings& s, std::vector<ProxyTarget>& out) {
+    uint32_t mask = maskBits == 0 ? 0 : (0xFFFFFFFFu << (32 - maskBits));
+    uint32_t start = network & mask;
+    uint32_t end = start | (~mask);
+    char buf[INET_ADDRSTRLEN];
+    for (uint32_t ip = start; ip <= end; ++ip) {
+        in_addr a{};
+        a.s_addr = htonl(ip);
+        if (!inet_ntop(AF_INET, &a, buf, sizeof(buf))) {
+            if (ip == 0xFFFFFFFFu) break; // guard overflow
+            continue;
+        }
+        const std::string ipStr(buf);
+        for (uint16_t port : kCommonProxyPorts) {
+            if (s.defaultProtocolForced) {
+                switch (s.defaultProtocol) {
+                    case Protocol::HTTP:
+                        out.push_back(ProxyTarget{Protocol::HTTP, ipStr, port, s.httpMode});
+                        break;
+                    case Protocol::SOCKS5:
+                        out.push_back(ProxyTarget{Protocol::SOCKS5, ipStr, port, std::nullopt});
+                        break;
+                    case Protocol::SOCKS4:
+                        out.push_back(ProxyTarget{Protocol::SOCKS4, ipStr, port, std::nullopt});
+                        break;
+                }
+            } else {
+                out.push_back(ProxyTarget{Protocol::HTTP, ipStr, port, HttpMode::CONNECT});
+                out.push_back(ProxyTarget{Protocol::HTTP, ipStr, port, HttpMode::DIRECT});
+                out.push_back(ProxyTarget{Protocol::SOCKS5, ipStr, port, std::nullopt});
+                out.push_back(ProxyTarget{Protocol::SOCKS4, ipStr, port, std::nullopt});
+            }
+        }
+        if (ip == 0xFFFFFFFFu) break; // guard overflow when maskBits==0
+    }
+}
+
+static bool generateProxiesFromRangeFile(const Settings& s, std::vector<ProxyTarget>& out, uint64_t& totalIpsOut) {
+    std::ifstream in(s.rangeFile);
+    if (!in.is_open()) {
+        std::cerr << "Failed to open range file: " << s.rangeFile << "\n";
+        return false;
+    }
+    totalIpsOut = 0ULL;
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(in, line)) {
+        ++lineNo;
+        std::string sline = trim(line);
+        if (sline.empty()) continue;
+        if (sline[0] == '#') continue;
+        uint32_t network = 0, maskBits = 0;
+        if (!parseCIDR(sline, network, maskBits)) {
+            std::cerr << "Invalid CIDR at " << s.rangeFile << ":" << lineNo << ": " << sline << "\n";
+            return false;
+        }
+        totalIpsOut += countIPsInCIDR(maskBits);
+        generateProxiesFromCIDR(network, maskBits, s, out);
+    }
+    return true;
+}
+
 static void buildProgressBar(uint64_t current, uint64_t total, int width, std::string& out) {
     out.clear();
     double ratio = (total == 0) ? 0.0 : (double)current / (double)total;
@@ -961,11 +1041,20 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
         uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
         uint64_t bad = counters.failed.load(std::memory_order_relaxed);
         uint64_t checked = ok + bad; // sessions that completed
-        uint64_t current = (started < total) ? started : total;
-        buildProgressBar(current, total, 28, bar);
-        double pct = (total == 0) ? 0.0 : (double)current * 100.0 / (double)total;
-        fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
-                bar.c_str(), pct, checked, total, ok, bad);
+        if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
+            uint64_t ipUnitsDone = checked / (uint64_t)s.sessionsPerIpForProgress;
+            if (ipUnitsDone > s.totalIpsForProgress) ipUnitsDone = s.totalIpsForProgress;
+            buildProgressBar(ipUnitsDone, s.totalIpsForProgress, 28, bar);
+            double pct = (s.totalIpsForProgress == 0) ? 0.0 : (double)ipUnitsDone * 100.0 / (double)s.totalIpsForProgress;
+            fprintf(stderr, "\r%s %5.1f%% | IPs: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
+                    bar.c_str(), pct, ipUnitsDone, s.totalIpsForProgress, ok, bad);
+        } else {
+            uint64_t current = (started < total) ? started : total;
+            buildProgressBar(current, total, 28, bar);
+            double pct = (total == 0) ? 0.0 : (double)current * 100.0 / (double)total;
+            fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
+                    bar.c_str(), pct, checked, total, ok, bad);
+        }
         fflush(stderr);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -975,9 +1064,15 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
     uint64_t ok = counters.succeeded.load(std::memory_order_relaxed);
     uint64_t bad = counters.failed.load(std::memory_order_relaxed);
     uint64_t checked = ok + bad;
-    buildProgressBar(total, total, 28, bar);
-    fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
-            bar.c_str(), 100.0, checked, total, ok, bad);
+    if (s.ipProgressMode && s.sessionsPerIpForProgress > 0) {
+        buildProgressBar(s.totalIpsForProgress, s.totalIpsForProgress, 28, bar);
+        fprintf(stderr, "\r%s %5.1f%% | IPs: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
+                bar.c_str(), 100.0, s.totalIpsForProgress, s.totalIpsForProgress, ok, bad);
+    } else {
+        buildProgressBar(total, total, 28, bar);
+        fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
+                bar.c_str(), 100.0, checked, total, ok, bad);
+    }
     fflush(stderr);
 }
 
@@ -995,10 +1090,38 @@ int main(int argc, char** argv) {
 	raiseNoFileLimit(settings.maxOpenFiles, settings.quiet);
 
 	std::vector<ProxyTarget> all;
-	if (!settings.rangeCIDR.empty()) {
+	if (!settings.rangeFile.empty()) {
+		settings.ipProgressMode = true;
+		uint64_t totalIps = 0;
+		if (!generateProxiesFromRangeFile(settings, all, totalIps)) {
+			return 1;
+		}
+		settings.totalIpsForProgress = totalIps;
+		// One IP yields N targets depending on protocol assumptions
+		uint64_t sessionsPerIp = 0;
+		if (!all.empty() && totalIps > 0) {
+			// approximate: total sessions divided by IPs
+			sessionsPerIp = (uint64_t)all.size() / totalIps;
+			if (sessionsPerIp == 0) sessionsPerIp = 1;
+		}
+		settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
+	} else if (!settings.rangeCIDR.empty()) {
+		settings.ipProgressMode = true;
+		uint32_t network=0, bits=0;
+		if (!parseCIDR(settings.rangeCIDR, network, bits)) {
+			std::cerr << "Invalid CIDR: " << settings.rangeCIDR << "\n";
+			return 1;
+		}
+		settings.totalIpsForProgress = countIPsInCIDR(bits);
 		if (!generateProxiesFromRange(settings, all)) {
 			return 1;
 		}
+		uint64_t sessionsPerIp = 0;
+		if (!all.empty() && settings.totalIpsForProgress > 0) {
+			sessionsPerIp = (uint64_t)all.size() / settings.totalIpsForProgress;
+			if (sessionsPerIp == 0) sessionsPerIp = 1;
+		}
+		settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
 	} else {
 		if (!readProxies(settings.inputFile, settings, all)) {
 			std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
@@ -1018,7 +1141,12 @@ int main(int argc, char** argv) {
 	}
 
 	Counters counters;
-	counters.total.store((uint64_t)all.size(), std::memory_order_relaxed);
+	if (settings.ipProgressMode && settings.totalIpsForProgress > 0 && settings.sessionsPerIpForProgress > 0) {
+		// total represents sessions to start, but for progress we want to show per-IP progress
+		counters.total.store((uint64_t)settings.totalIpsForProgress * (uint64_t)settings.sessionsPerIpForProgress, std::memory_order_relaxed);
+	} else {
+		counters.total.store((uint64_t)all.size(), std::memory_order_relaxed);
+	}
 	std::atomic<bool> progressStop{false};
 	std::thread progressThread;
 	if (!settings.quiet) {
