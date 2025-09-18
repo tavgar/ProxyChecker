@@ -24,6 +24,8 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -97,6 +99,8 @@ struct Settings {
 	    // Progress helpers for scan-all-ports mode
 	    uint64_t totalPortsForProgress{0};
 	    uint32_t sessionsPerPortForProgress{0};
+	    // Bounded streaming queue capacity for range scans
+	    int queueCapacity{0};
 };
 
 static inline uint64_t nowMs() {
@@ -264,13 +268,74 @@ struct Session {
 
 static std::mutex g_printMutex;
 
+// Simple bounded thread-safe queue for streaming tasks
+class TaskQueue {
+public:
+    explicit TaskQueue(size_t capacity)
+        : capacity_(capacity), closed_(false) {}
+
+    bool push(ProxyTarget&& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_full_cv_.wait(lock, [&]{ return closed_ || queue_.size() < capacity_; });
+        if (closed_) return false;
+        queue_.push_back(std::move(item));
+        not_empty_cv_.notify_one();
+        return true;
+    }
+
+    bool try_pop(ProxyTarget& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return false;
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        not_full_cv_.notify_one();
+        return true;
+    }
+
+    bool wait_pop(ProxyTarget& out) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_empty_cv_.wait(lock, [&]{ return closed_ || !queue_.empty(); });
+        if (queue_.empty()) return false; // closed and empty
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        not_full_cv_.notify_one();
+        return true;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        not_empty_cv_.notify_all();
+        not_full_cv_.notify_all();
+    }
+
+    bool isClosedAndEmpty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_ && queue_.empty();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable not_empty_cv_;
+    std::condition_variable not_full_cv_;
+    std::deque<ProxyTarget> queue_;
+    size_t capacity_;
+    bool closed_;
+};
+
 class Worker {
 public:
-	Worker(int id,
-		const Settings& s,
-		std::vector<ProxyTarget> proxies,
-		Counters& counters)
-		: id_(id), settings_(s), proxies_(std::move(proxies)), counters_(counters) {}
+    Worker(int id,
+        const Settings& s,
+        std::vector<ProxyTarget> proxies,
+        Counters& counters)
+        : id_(id), settings_(s), proxies_(std::move(proxies)), counters_(counters) {}
+
+    Worker(int id,
+        const Settings& s,
+        std::shared_ptr<TaskQueue> queue,
+        Counters& counters)
+        : id_(id), settings_(s), counters_(counters), taskQueue_(std::move(queue)) {}
 
 	void start() {
 		thread_ = std::thread([this]() { this->run(); });
@@ -284,17 +349,18 @@ private:
 	int id_;
 	Settings settings_;
 	std::vector<ProxyTarget> proxies_;
+    std::shared_ptr<TaskQueue> taskQueue_;
 	Counters& counters_;
 	std::thread thread_;
 	int epfd_{-1};
 	std::ofstream out_;
-	uint64_t nextIndex_{0};
+    uint64_t nextIndex_{0};
 	uint32_t nextDeadlineVersion_{1};
 	int active_{0};
 
 	static constexpr int kMaxEvents = 4096;
 
-	void run() {
+    void run() {
 		std::string outPath = settings_.outputFile.empty()
 			? std::string()
 			: (settings_.outputFile + "." + std::to_string(id_));
@@ -310,11 +376,11 @@ private:
 
 		// total is set upfront in main
 
-		// Prime initial sessions
-		refill();
+        // Prime initial sessions
+        refill();
 
 		epoll_event events[kMaxEvents];
-		while (active_ > 0) {
+        while (active_ > 0 || (taskQueue_ && !taskQueue_->isClosedAndEmpty())) {
 			int timeout = 10; // ms
 			int n = epoll_wait(epfd_, events, kMaxEvents, timeout);
 			if (n < 0) {
@@ -338,18 +404,34 @@ private:
 				}
 			}
 			checkTimeouts();
-			refill();
+            refill();
 		}
 
 		if (out_.is_open()) { out_.flush(); out_.close(); }
 		if (epfd_ >= 0) close(epfd_);
 	}
 
-	void refill() {
-		while (active_ < settings_.concurrencyPerWorker && nextIndex_ < proxies_.size()) {
-			launch(proxies_[nextIndex_++]);
-		}
-	}
+    void refill() {
+        if (taskQueue_) {
+            // Streaming mode
+            while (active_ < settings_.concurrencyPerWorker) {
+                ProxyTarget tgt;
+                bool ok = false;
+                if (active_ == 0) {
+                    ok = taskQueue_->wait_pop(tgt);
+                } else {
+                    ok = taskQueue_->try_pop(tgt);
+                }
+                if (!ok) break;
+                launch(tgt);
+            }
+        } else {
+            // Preloaded vector mode
+            while (active_ < settings_.concurrencyPerWorker && nextIndex_ < proxies_.size()) {
+                launch(proxies_[nextIndex_++]);
+            }
+        }
+    }
 
 	void setEpoll(int fd, Session* sess, uint32_t events, bool add) {
 		epoll_event ev{};
@@ -781,6 +863,7 @@ static void usage(const char* argv0) {
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
 	std::cerr << "  --quiet               Reduce logging\n";
 	std::cerr << "  --scan-all-ports      Scan all ports (1-65535) for each IP in range modes\n";
+	std::cerr << "  --queue-size N        Bounded queue capacity for range scanning (default: workers*concurrency*2)\n";
 	    std::cerr << "\n";
 	    std::cerr << "Notes:\n";
 	    std::cerr << "  - If a line omits protocol (e.g., ip:port) and --default-proto is NOT provided,\n";
@@ -827,6 +910,7 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--keep-parts") { s.keepParts = true; }
 		else if (a == "--quiet") { s.quiet = true; }
 		else if (a == "--scan-all-ports") { s.scanAllPorts = true; }
+		else if (a == "--queue-size") { const char* v = need("--queue-size"); if (!v) return false; s.queueCapacity = std::max(1, atoi(v)); }
 		else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
 	}
@@ -1122,84 +1206,156 @@ int main(int argc, char** argv) {
 	raiseNoFileLimit(settings.maxOpenFiles, settings.quiet);
 
 	std::vector<ProxyTarget> all;
-	if (!settings.rangeFile.empty()) {
+	bool streamingMode = false;
+
+	// Determine mode and compute progress totals without preallocation for range modes
+	if (!settings.rangeFile.empty() || !settings.rangeCIDR.empty()) {
+		streamingMode = true;
 		settings.ipProgressMode = true;
 		uint64_t totalIps = 0;
-		if (!generateProxiesFromRangeFile(settings, all, totalIps)) {
-			return 1;
+		if (!settings.rangeFile.empty()) {
+			// Sum IPs across all CIDRs in file
+			std::ifstream in(settings.rangeFile);
+			if (!in.is_open()) {
+				std::cerr << "Failed to open range file: " << settings.rangeFile << "\n";
+				return 1;
+			}
+			std::string line; int lineNo = 0;
+			while (std::getline(in, line)) {
+				++lineNo;
+				std::string sline = trim(line);
+				if (sline.empty() || sline[0] == '#') continue;
+				uint32_t network=0, bits=0;
+				if (!parseCIDR(sline, network, bits)) {
+					std::cerr << "Invalid CIDR at " << settings.rangeFile << ":" << lineNo << ": " << sline << "\n";
+					return 1;
+				}
+				totalIps += countIPsInCIDR(bits);
+			}
+		} else {
+			uint32_t network=0, bits=0;
+			if (!parseCIDR(settings.rangeCIDR, network, bits)) {
+				std::cerr << "Invalid CIDR: " << settings.rangeCIDR << "\n";
+				return 1;
+			}
+			totalIps = countIPsInCIDR(bits);
 		}
 		settings.totalIpsForProgress = totalIps;
-		// Compute progress units
+		uint64_t protocolsPerTarget = settings.defaultProtocolForced ? 1ULL : 4ULL;
 		if (settings.scanAllPorts) {
 			settings.totalPortsForProgress = totalIps * 65535ULL;
-			uint64_t sessionsPerPort = 0;
-			if (!all.empty() && settings.totalPortsForProgress > 0) {
-				sessionsPerPort = (uint64_t)all.size() / settings.totalPortsForProgress;
-				if (sessionsPerPort == 0) sessionsPerPort = 1;
-			}
-			settings.sessionsPerPortForProgress = (uint32_t)sessionsPerPort;
+			settings.sessionsPerPortForProgress = (uint32_t)protocolsPerTarget;
 		} else {
-			// One IP yields N targets depending on protocol assumptions
-			uint64_t sessionsPerIp = 0;
-			if (!all.empty() && totalIps > 0) {
-				// approximate: total sessions divided by IPs
-				sessionsPerIp = (uint64_t)all.size() / totalIps;
-				if (sessionsPerIp == 0) sessionsPerIp = 1;
-			}
-			settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
-		}
-	} else if (!settings.rangeCIDR.empty()) {
-		settings.ipProgressMode = true;
-		uint32_t network=0, bits=0;
-		if (!parseCIDR(settings.rangeCIDR, network, bits)) {
-			std::cerr << "Invalid CIDR: " << settings.rangeCIDR << "\n";
-			return 1;
-		}
-		settings.totalIpsForProgress = countIPsInCIDR(bits);
-		if (!generateProxiesFromRange(settings, all)) {
-			return 1;
-		}
-		if (settings.scanAllPorts) {
-			settings.totalPortsForProgress = settings.totalIpsForProgress * 65535ULL;
-			uint64_t sessionsPerPort = 0;
-			if (!all.empty() && settings.totalPortsForProgress > 0) {
-				sessionsPerPort = (uint64_t)all.size() / settings.totalPortsForProgress;
-				if (sessionsPerPort == 0) sessionsPerPort = 1;
-			}
-			settings.sessionsPerPortForProgress = (uint32_t)sessionsPerPort;
-		} else {
-			uint64_t sessionsPerIp = 0;
-			if (!all.empty() && settings.totalIpsForProgress > 0) {
-				sessionsPerIp = (uint64_t)all.size() / settings.totalIpsForProgress;
-				if (sessionsPerIp == 0) sessionsPerIp = 1;
-			}
-			settings.sessionsPerIpForProgress = (uint32_t)sessionsPerIp;
+			const uint64_t commonPortCount = (uint64_t)(sizeof(kCommonProxyPorts) / sizeof(kCommonProxyPorts[0]));
+			settings.sessionsPerIpForProgress = (uint32_t)(protocolsPerTarget * commonPortCount);
 		}
 	} else {
+		// Input file mode: preload
 		if (!readProxies(settings.inputFile, settings, all)) {
 			std::cerr << "Failed to read proxies from " << settings.inputFile << "\n";
 			return 1;
 		}
-	}
-	if (all.empty()) {
-		std::cerr << "No proxies generated from input/range\n";
-		return 1;
+		if (all.empty()) {
+			std::cerr << "No proxies generated from input file\n";
+			return 1;
+		}
 	}
 
-	// Shard proxies across workers
+	// Number of workers
 	int workers = std::max(1, settings.numWorkers);
-	std::vector<std::vector<ProxyTarget>> shards((size_t)workers);
-	for (size_t i = 0; i < all.size(); ++i) {
-		shards[i % shards.size()].push_back(std::move(all[i]));
+
+	// Prepare streaming queue if needed
+	std::shared_ptr<TaskQueue> taskQueue;
+	std::thread producerThread;
+	if (streamingMode) {
+		int capacity = settings.queueCapacity;
+		if (capacity <= 0) {
+			capacity = std::max(1, workers * settings.concurrencyPerWorker * 2);
+		}
+		taskQueue = std::make_shared<TaskQueue>((size_t)capacity);
+		// Producer lambda for pushing tasks on-the-fly
+		auto pushForIpPort = [&](const std::string& ipStr, uint16_t port){
+			if (settings.defaultProtocolForced) {
+				switch (settings.defaultProtocol) {
+					case Protocol::HTTP:
+						(void)taskQueue->push(ProxyTarget{Protocol::HTTP, ipStr, port, settings.httpMode});
+						break;
+					case Protocol::SOCKS5:
+						(void)taskQueue->push(ProxyTarget{Protocol::SOCKS5, ipStr, port, std::nullopt});
+						break;
+					case Protocol::SOCKS4:
+						(void)taskQueue->push(ProxyTarget{Protocol::SOCKS4, ipStr, port, std::nullopt});
+						break;
+				}
+			} else {
+				(void)taskQueue->push(ProxyTarget{Protocol::HTTP, ipStr, port, HttpMode::CONNECT});
+				(void)taskQueue->push(ProxyTarget{Protocol::HTTP, ipStr, port, HttpMode::DIRECT});
+				(void)taskQueue->push(ProxyTarget{Protocol::SOCKS5, ipStr, port, std::nullopt});
+				(void)taskQueue->push(ProxyTarget{Protocol::SOCKS4, ipStr, port, std::nullopt});
+			}
+		};
+		producerThread = std::thread([&, pushForIpPort]() {
+			char ipbuf[INET_ADDRSTRLEN];
+			auto produceCIDR = [&](uint32_t network, uint32_t maskBits){
+				uint32_t mask = maskBits == 0 ? 0 : (0xFFFFFFFFu << (32 - maskBits));
+				uint32_t start = network & mask;
+				uint32_t end = start | (~mask);
+				for (uint32_t ip = start; ip <= end; ++ip) {
+					in_addr a{}; a.s_addr = htonl(ip);
+					if (!inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf))) {
+						if (ip == 0xFFFFFFFFu) break;
+						continue;
+					}
+					std::string ipStr(ipbuf);
+					if (settings.scanAllPorts) {
+						for (uint32_t p = 1; p <= 65535u; ++p) pushForIpPort(ipStr, (uint16_t)p);
+					} else {
+						for (uint16_t port : kCommonProxyPorts) pushForIpPort(ipStr, port);
+					}
+					if (ip == 0xFFFFFFFFu) break; // guard overflow
+				}
+			};
+			if (!settings.rangeFile.empty()) {
+				std::ifstream in(settings.rangeFile);
+				std::string line; int lineNo = 0;
+				while (std::getline(in, line)) {
+					++lineNo;
+					std::string sline = trim(line);
+					if (sline.empty() || sline[0] == '#') continue;
+					uint32_t network=0, bits=0;
+					if (!parseCIDR(sline, network, bits)) {
+						continue; // skip invalid here; already validated earlier
+					}
+					produceCIDR(network, bits);
+				}
+			} else if (!settings.rangeCIDR.empty()) {
+				uint32_t network=0, bits=0;
+				if (parseCIDR(settings.rangeCIDR, network, bits)) {
+					produceCIDR(network, bits);
+				}
+			}
+			taskQueue->close();
+		});
+	}
+
+	// Shard proxies across workers (input file mode only)
+	std::vector<std::vector<ProxyTarget>> shards;
+	if (!streamingMode) {
+		shards.assign((size_t)workers, {});
+		for (size_t i = 0; i < all.size(); ++i) {
+			shards[i % shards.size()].push_back(std::move(all[i]));
+		}
 	}
 
 	Counters counters;
-	if (settings.scanAllPorts && settings.ipProgressMode && settings.totalPortsForProgress > 0 && settings.sessionsPerPortForProgress > 0) {
-		// total represents sessions to start, but for progress we want to show per-Port (across IPs) progress
-		counters.total.store((uint64_t)settings.totalPortsForProgress * (uint64_t)settings.sessionsPerPortForProgress, std::memory_order_relaxed);
-	} else if (settings.ipProgressMode && settings.totalIpsForProgress > 0 && settings.sessionsPerIpForProgress > 0) {
-		// total represents sessions to start, but for progress we want to show per-IP progress
-		counters.total.store((uint64_t)settings.totalIpsForProgress * (uint64_t)settings.sessionsPerIpForProgress, std::memory_order_relaxed);
+	if (streamingMode) {
+		if (settings.scanAllPorts && settings.totalPortsForProgress > 0 && settings.sessionsPerPortForProgress > 0) {
+			counters.total.store((uint64_t)settings.totalPortsForProgress * (uint64_t)settings.sessionsPerPortForProgress, std::memory_order_relaxed);
+		} else if (settings.totalIpsForProgress > 0 && settings.sessionsPerIpForProgress > 0) {
+			counters.total.store((uint64_t)settings.totalIpsForProgress * (uint64_t)settings.sessionsPerIpForProgress, std::memory_order_relaxed);
+		} else {
+			counters.total.store(0, std::memory_order_relaxed);
+		}
 	} else {
 		counters.total.store((uint64_t)all.size(), std::memory_order_relaxed);
 	}
@@ -1210,13 +1366,22 @@ int main(int argc, char** argv) {
 	}
 	std::vector<std::unique_ptr<Worker>> workerObjs;
 	workerObjs.reserve((size_t)workers);
-	for (int i = 0; i < workers; ++i) {
-		workerObjs.emplace_back(std::make_unique<Worker>(i, settings, std::move(shards[(size_t)i]), counters));
+	if (streamingMode) {
+		for (int i = 0; i < workers; ++i) {
+			workerObjs.emplace_back(std::make_unique<Worker>(i, settings, taskQueue, counters));
+		}
+		uint64_t expected = counters.total.load(std::memory_order_relaxed);
+		logf(settings.quiet, "Starting %d workers (streaming), expected sessions: %" PRIu64, workers, expected);
+	} else {
+		for (int i = 0; i < workers; ++i) {
+			workerObjs.emplace_back(std::make_unique<Worker>(i, settings, std::move(shards[(size_t)i]), counters));
+		}
+		uint64_t totalWork = (uint64_t)all.size();
+		logf(settings.quiet, "Starting %d workers, total proxies: %" PRIu64, workers, totalWork);
 	}
-	uint64_t totalWork = (uint64_t)all.size();
-	logf(settings.quiet, "Starting %d workers, total proxies: %" PRIu64, workers, totalWork);
 	for (auto& w : workerObjs) w->start();
 	for (auto& w : workerObjs) w->join();
+	if (producerThread.joinable()) producerThread.join();
 	progressStop.store(true, std::memory_order_relaxed);
 	if (progressThread.joinable()) progressThread.join();
 
