@@ -40,6 +40,13 @@ make -C ProxyChecker -j
 ./proxychecker --range-file range_list.txt --out good_from_ranges.txt \
   --workers 8 --concurrency 4096 \
   --timeout 2
+
+# Scan all ports (1-65535) for each IP in a range
+./proxychecker --range 10.0.0.0/30 --scan-all-ports --out good_full_scan.txt \
+  --workers 12 --concurrency 50000 --timeout 5
+
+# Example: scan ranges from a file across all ports with custom worker/concurrency
+./proxychecker --range-file 212.txt --scan-all-ports --workers 12 --concurrency 50000 --timeout 5 --out good_full_scan_from_file.txt
 ```
 
 Input file format:
@@ -52,6 +59,7 @@ Range scanning:
 - Use `--range CIDR` (e.g., `10.0.0.0/24`) to enumerate all IPv4 addresses in the range
   and test common proxy ports (80, 8080, 1080, 3128, 8888, 8000, 8081, 8082, 3129, 4145, 9999).
 - Use `--range-file FILE` to provide multiple CIDR ranges, one per line.
+- Use `--scan-all-ports` to scan all ports 1..65535 for each IP instead of only common ports.
 - `--in`, `--range`, and `--range-file` are mutually exclusive.
 
 Real-time feedback:
