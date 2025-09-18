@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -60,6 +61,8 @@ struct ProxyTarget {
 	Protocol protocol;
 	std::string host; // numeric IP or hostname
 	uint16_t port;
+    // Optional per-target HTTP mode override (only used when protocol==HTTP)
+    std::optional<HttpMode> httpModeOverride;
 };
 
 struct Settings {
@@ -130,36 +133,47 @@ static std::string trim(const std::string& s) {
 	return s.substr(i, j - i);
 }
 
-static std::optional<ProxyTarget> parseProxyLine(const std::string& line, Protocol defaultProto) {
+struct ParsedProxyLine {
+	std::string host;
+	uint16_t port{0};
+	Protocol proto{Protocol::HTTP};
+	bool explicitProto{false};
+};
+
+static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& line, Protocol defaultProto) {
 	std::string s = trim(line);
 	if (s.empty()) return std::nullopt;
 	if (s[0] == '#') return std::nullopt;
 
 	Protocol proto = defaultProto;
+	bool explicitProto = false;
 	std::string hostport;
 	// Allow protocol://host:port
 	if (s.rfind("socks5://", 0) == 0) {
 		proto = Protocol::SOCKS5;
+		explicitProto = true;
 		hostport = s.substr(9);
 	} else if (s.rfind("socks4://", 0) == 0) {
 		proto = Protocol::SOCKS4;
+		explicitProto = true;
 		hostport = s.substr(9);
 	} else if (s.rfind("http://", 0) == 0) {
 		proto = Protocol::HTTP;
+		explicitProto = true;
 		hostport = s.substr(7);
 	} else {
 		hostport = s;
 	}
 
-	// Also support trailing ",proto" or whitespace proto
+	// Also support trailing ",proto"
 	{
 		size_t comma = hostport.find(',');
 		if (comma != std::string::npos) {
 			std::string p = trim(hostport.substr(comma + 1));
 			hostport = trim(hostport.substr(0, comma));
-			if (p == "socks5") proto = Protocol::SOCKS5;
-			else if (p == "socks4") proto = Protocol::SOCKS4;
-			else if (p == "http") proto = Protocol::HTTP;
+			if (p == "socks5") { proto = Protocol::SOCKS5; explicitProto = true; }
+			else if (p == "socks4") { proto = Protocol::SOCKS4; explicitProto = true; }
+			else if (p == "http") { proto = Protocol::HTTP; explicitProto = true; }
 		}
 	}
 
@@ -184,7 +198,7 @@ static std::optional<ProxyTarget> parseProxyLine(const std::string& line, Protoc
 		if (host.empty() || portStr.empty()) return std::nullopt;
 		uint16_t port = 0;
 		if (!parseUint16(portStr, port)) return std::nullopt;
-		return ProxyTarget{proto, host, port};
+		return ParsedProxyLine{host, port, proto, explicitProto};
 	}
 }
 
@@ -221,6 +235,7 @@ struct Session {
 	uint32_t deadlineVersion{0};
 	std::string proxyHost;
 	uint16_t proxyPort{0};
+    std::optional<HttpMode> httpModeOverride; // honored when proto==HTTP
 	// Buffers
 	std::string writeBuf;
 	std::string readBuf;
@@ -431,6 +446,7 @@ private:
 		sess->proto = tgt.protocol;
 		sess->proxyHost = tgt.host;
 		sess->proxyPort = tgt.port;
+		sess->httpModeOverride = tgt.httpModeOverride;
 		sess->worker = this;
 		sess->state = SessionState::CONNECTING;
 		sess->writeBuf.clear();
@@ -464,7 +480,8 @@ private:
 			// Connected
 			switch (sess->proto) {
 				case Protocol::HTTP: {
-					bool useConnect = (settings_.httpMode == HttpMode::CONNECT) || (settings_.testPort != 80);
+					HttpMode mode = sess->httpModeOverride.has_value() ? *sess->httpModeOverride : settings_.httpMode;
+					bool useConnect = (mode == HttpMode::CONNECT) || (settings_.testPort != 80);
 					if (useConnect) {
 						prepareHttpConnect(sess, settings_.testHost, settings_.testPort);
 						sess->state = SessionState::HTTP_CONNECT_SEND;
@@ -742,6 +759,10 @@ static void usage(const char* argv0) {
 	std::cerr << "  --http-mode [connect|direct] HTTP proxy verification mode (default: connect)\n";
 	std::cerr << "  --no-merge            Do not merge per-thread outputs\n";
 	std::cerr << "  --quiet               Reduce logging\n";
+    std::cerr << "\n";
+    std::cerr << "Notes:\n";
+    std::cerr << "  - If a line omits protocol (e.g., ip:port), the checker tries http (CONNECT and DIRECT), socks4, and socks5.\n";
+    std::cerr << "  - In that case, --default-proto is ignored.\n";
 	std::cerr << std::flush;
 }
 
@@ -782,8 +803,18 @@ static bool readProxies(const std::string& path, Protocol defaultProto, std::vec
 	if (!in.is_open()) return false;
 	std::string line;
 	while (std::getline(in, line)) {
-		auto v = parseProxyLine(line, defaultProto);
-		if (v) out.push_back(*v);
+        auto v = parseProxyLineDetailed(line, defaultProto);
+        if (!v) continue;
+        const ParsedProxyLine& pl = *v;
+        if (pl.explicitProto) {
+            out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
+        } else {
+            // Expand unspecified protocol to try all protocols and HTTP modes
+            out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT});
+            out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::DIRECT});
+            out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
+            out.push_back(ProxyTarget{Protocol::SOCKS4, pl.host, pl.port, std::nullopt});
+        }
 	}
 	return true;
 }
