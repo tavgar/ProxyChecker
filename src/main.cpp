@@ -109,32 +109,98 @@ static inline uint64_t nowMs() {
 	return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Extract first IPv4 address from buffer; returns true if found
-static bool extractFirstIPv4FromBuffer(const char* data, size_t len, std::string& out) {
-    auto isDigit = [](char c){ return c >= '0' && c <= '9'; };
-    for (size_t i = 0; i < len; ++i) {
-        size_t p = i;
-        int octets[4];
-        bool ok = true;
-        for (int oct = 0; oct < 4; ++oct) {
-            if (p >= len || !isDigit(data[p])) { ok = false; break; }
-            int val = 0; size_t digits = 0;
-            while (p < len && isDigit(data[p]) && digits < 3) { val = val * 10 + (data[p] - '0'); ++p; ++digits; }
-            if (val > 255) { ok = false; break; }
-            if (digits == 0) { ok = false; break; }
-            octets[oct] = val;
-            if (oct < 3) {
-                if (p >= len || data[p] != '.') { ok = false; break; }
-                ++p;
+// Validate IPv4 string and ensure it is publicly routable (not private/special)
+static bool isPublicIPv4(const std::string& ipStr) {
+    in_addr addr{};
+    if (inet_pton(AF_INET, ipStr.c_str(), &addr) != 1) return false;
+    uint32_t ip = ntohl(addr.s_addr);
+    auto inRange = [&](uint32_t base, uint32_t maskBits) {
+        uint32_t mask = maskBits == 0 ? 0u : (0xFFFFFFFFu << (32 - maskBits));
+        return (ip & mask) == (base & mask);
+    };
+    // 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24,
+    // 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24,
+    // 224/4 (multicast), 240/4 (reserved), 255.255.255.255/32 (broadcast)
+    if (inRange(0x00000000u, 8)) return false;         // 0.0.0.0/8
+    if (inRange(0x0A000000u, 8)) return false;         // 10.0.0.0/8
+    if (inRange(0x64400000u, 10)) return false;        // 100.64.0.0/10
+    if (inRange(0x7F000000u, 8)) return false;         // 127.0.0.0/8
+    if (inRange(0xA9FE0000u, 16)) return false;        // 169.254.0.0/16
+    if (inRange(0xAC100000u, 12)) return false;        // 172.16.0.0/12
+    if (inRange(0xC0000000u, 24)) return false;        // 192.0.0.0/24
+    if (inRange(0xC0000200u, 24)) return false;        // 192.0.2.0/24
+    if (inRange(0xC0586300u, 24)) return false;        // 192.88.99.0/24
+    if (inRange(0xC0A80000u, 16)) return false;        // 192.168.0.0/16
+    if (inRange(0xC6120000u, 15)) return false;        // 198.18.0.0/15
+    if (inRange(0xC6336400u, 24)) return false;        // 198.51.100.0/24
+    if (inRange(0xCB007100u, 24)) return false;        // 203.0.113.0/24
+    if (inRange(0xE0000000u, 4)) return false;         // 224.0.0.0/4
+    if (inRange(0xF0000000u, 4)) return false;         // 240.0.0.0/4
+    if (ip == 0xFFFFFFFFu) return false;               // 255.255.255.255
+    return true;
+}
+
+// Extract a public IPv4 from an ifconfig-style response body.
+// Only accept: (1) the first non-empty line being exactly an IPv4, or
+//              (2) JSON with keys "ip" or "origin" containing an IPv4.
+static bool extractIPv4StrictFromBody(const char* data, size_t len, std::string& out) {
+    if (!data || len == 0) return false;
+    std::string body(data, len);
+    // Fast path: first non-empty trimmed line is exactly an IPv4
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t lineEnd = body.find('\n', pos);
+        if (lineEnd == std::string::npos) lineEnd = body.size();
+        // Trim CR and spaces
+        size_t start = pos;
+        while (start < lineEnd && (body[start] == ' ' || body[start] == '\t' || body[start] == '\r')) ++start;
+        size_t end = lineEnd;
+        while (end > start && (body[end - 1] == ' ' || body[end - 1] == '\t' || body[end - 1] == '\r')) --end;
+        if (end > start) {
+            std::string line = body.substr(start, end - start);
+            // Ensure line consists only of digits and dots
+            bool digitsAndDots = true; int dotCount = 0;
+            for (char c : line) { if (!((c >= '0' && c <= '9') || c == '.')) { digitsAndDots = false; break; } if (c == '.') ++dotCount; }
+            if (digitsAndDots && dotCount == 3) {
+                if (isPublicIPv4(line)) { out = line; return true; }
+                // If first token is not public, do not accept; continue scanning lines
             }
+            // first non-empty line was not a pure IP; stop fast-path
+            break;
         }
-        if (ok) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
-            out.assign(buf);
-            return true;
-        }
+        pos = (lineEnd == body.size()) ? body.size() : (lineEnd + 1);
     }
+    // JSON path: look for "ip" or "origin" fields
+    auto tryKey = [&](const char* key) -> bool {
+        size_t kpos = body.find(key);
+        if (kpos == std::string::npos) return false;
+        kpos = body.find(':', kpos);
+        if (kpos == std::string::npos) return false;
+        // Find first quote after colon
+        size_t q1 = body.find('"', kpos);
+        if (q1 == std::string::npos) return false;
+        size_t q2 = body.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 <= q1 + 1) return false;
+        std::string val = body.substr(q1 + 1, q2 - (q1 + 1));
+        // Value may contain comma-separated list; take first token
+        size_t comma = val.find(',');
+        if (comma != std::string::npos) val = val.substr(0, comma);
+        // Trim spaces
+        size_t si = 0, sj = val.size();
+        while (si < sj && (val[si] == ' ' || val[si] == '\t')) ++si;
+        while (sj > si && (val[sj - 1] == ' ' || val[sj - 1] == '\t')) --sj;
+        val = val.substr(si, sj - si);
+        // If space-separated addresses, take first token
+        size_t sp = val.find(' ');
+        if (sp != std::string::npos) val = val.substr(0, sp);
+        // Basic shape check: digits and dots with 3 dots
+        bool digitsAndDots = !val.empty(); int dotCount = 0;
+        for (char c : val) { if (!((c >= '0' && c <= '9') || c == '.')) { digitsAndDots = false; break; } if (c == '.') ++dotCount; }
+        if (digitsAndDots && dotCount == 3 && isPublicIPv4(val)) { out = val; return true; }
+        return false;
+    };
+    if (tryKey("\"ip\"")) return true;
+    if (tryKey("\"origin\"")) return true;
     return false;
 }
 
@@ -932,8 +998,8 @@ private:
 				sess->headersComplete = true;
 				size_t bodyPos = hdrEnd + 4;
 				if (bodyPos >= sess->readBuf.size()) return; // wait for body
-				std::string ip;
-				if (extractFirstIPv4(sess->readBuf.data() + bodyPos, sess->readBuf.size() - bodyPos, ip)) {
+                std::string ip;
+                if (extractIPv4StrictFromBody(sess->readBuf.data() + bodyPos, sess->readBuf.size() - bodyPos, ip)) {
 					// Require that the returned IP differs from our baseline to confirm masking
 					if (!sess->worker->settings_.clientPublicIP.empty()) {
 						if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
@@ -1149,7 +1215,7 @@ static bool fetchBaselinePublicIP(Settings& settings) {
     size_t bodyPos = hdrEnd + 4;
     if (bodyPos >= buf.size()) return false;
     std::string ip;
-    if (extractFirstIPv4FromBuffer(buf.data() + bodyPos, buf.size() - bodyPos, ip)) {
+    if (extractIPv4StrictFromBody(buf.data() + bodyPos, buf.size() - bodyPos, ip)) {
         settings.clientPublicIP = ip;
         return true;
     }
