@@ -13,7 +13,7 @@ A blazing-fast, `epoll`-based, multi-threaded proxy checker written in C++20.
 
 * Verification model:
 
-  * HTTP proxies: validate via HTTP CONNECT to the target (default: 443)
+  * HTTP proxies: validate via HTTP CONNECT to the target (default: 443). When using a cleartext test service on port 80 (e.g., `ifconfig.io`), the checker performs an HTTP GET through the proxy and requires that the returned public IP differs from the client's baseline IP to avoid false positives.
   * SOCKS4/5: perform CONNECT to the target; if the target is port 80, send an HTTP HEAD request
 * Supports HTTP, SOCKS4, SOCKS5
 * Highly parallel with per-thread `epoll` and sharded inputs
@@ -65,6 +65,26 @@ make -C ProxyChecker -j
 
 # Example: scan ranges from a file across all ports with custom worker/concurrency
 ./proxychecker --range-file 212.txt --scan-all-ports --workers 12 --concurrency 50000 --timeout 5 --out good_full_scan_from_file.txt
+```
+
+### HTTP proxy validation and masking on port 80
+
+When verifying HTTP proxies against a cleartext test service on port 80 (for example, `--test-host ifconfig.io --test-port 80 --test-path /`), the checker performs a second-stage validation to ensure the endpoint is a real proxy that forwards traffic and masks your IP:
+
+- It first establishes the proxy (HTTP CONNECT if applicable).
+- It then sends an HTTP GET to the test service through the proxy.
+- It extracts the first IPv4 address from the response body and compares it to the client’s own baseline public IP, which is fetched directly (without proxy) from the same test service.
+- The proxy is considered valid only if the response contains an IP and it differs from the baseline IP.
+- If the baseline IP cannot be determined, the tool fails such sessions to avoid false positives.
+
+Example usage for range scans with masking validation on port 80:
+
+```bash
+./proxychecker --range-file ipranges.txt \
+  --workers 4 --concurrency 20000 \
+  --timeout 2 \
+  --out good.txt \
+  --test-host ifconfig.io --test-port 80 --test-path /
 ```
 
 ## Streaming generation for range scans

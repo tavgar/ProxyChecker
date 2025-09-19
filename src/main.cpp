@@ -921,8 +921,8 @@ private:
 				if (!(sess->statusCode >= 200 && sess->statusCode < 300)) { failSession(sess); return; }
 				// For SOCKS HTTP verification, we do not require IP masking; treat 2xx as success
 				if (sess->state == SessionState::SOCKS_HTTP_RECV) { succeedSession(sess); return; }
-				// For HTTP direct or tunneled GET, if masking not required, success
-				if (!sess->requireIpMasking || sess->worker->settings_.clientPublicIP.empty()) { succeedSession(sess); return; }
+				// For HTTP direct or tunneled GET: if masking is not required (non-80 test port), 2xx is success
+				if (!sess->requireIpMasking) { succeedSession(sess); return; }
 				// Need headers end to parse body
 				size_t hdrEnd = sess->readBuf.find("\r\n\r\n");
 				if (hdrEnd == std::string::npos) {
@@ -934,11 +934,17 @@ private:
 				if (bodyPos >= sess->readBuf.size()) return; // wait for body
 				std::string ip;
 				if (extractFirstIPv4(sess->readBuf.data() + bodyPos, sess->readBuf.size() - bodyPos, ip)) {
-					if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
-						succeedSession(sess);
+					// Require that the returned IP differs from our baseline to confirm masking
+					if (!sess->worker->settings_.clientPublicIP.empty()) {
+						if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
+							succeedSession(sess);
+							return;
+						}
+						// Found but equals our own IP => not a proxy masking -> fail
+						failSession(sess);
 						return;
 					}
-					// Found but equals our own IP => not a proxy masking -> fail
+					// Baseline IP unknown; cannot confirm masking reliably -> fail to avoid false positives
 					failSession(sess);
 					return;
 				}
