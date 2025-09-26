@@ -1101,19 +1101,18 @@ private:
 				// Non-80 or Google: 2xx response is sufficient
 				// For Google, we just need successful connectivity, not IP parsing
 				if (sess->worker->settings_.testHost == "google.com") {
-					// Accept any reasonable Google response (including bot detection redirects)
-					if (sess->readBuf.find("</html>") != std::string::npos || 
-					    sess->readBuf.find("Google") != std::string::npos ||
-					    sess->readBuf.find("DOCTYPE") != std::string::npos ||
-					    sess->readBuf.find("302 Found") != std::string::npos ||
-					    sess->readBuf.find("302 Moved") != std::string::npos ||
-					    sess->readBuf.find("Location:") != std::string::npos ||
-					    sess->readBuf.find("location:") != std::string::npos ||
-					    sess->readBuf.find("www.google.com") != std::string::npos ||
-					    sess->readBuf.find("sorry/index") != std::string::npos) {
+					// Accept only genuine Google responses - very strict to avoid false positives
+					// Require authentic Google server headers
+					bool hasGoogleServer = (sess->readBuf.find("Server: gws") != std::string::npos ||
+					                       sess->readBuf.find("Server: ESF") != std::string::npos ||
+					                       sess->readBuf.find("Server: sffe") != std::string::npos);
+					if (hasGoogleServer) {
 						succeedSession(sess);
 						return;
 					}
+					// Google test failed - no authentic Google server header
+					failSession(sess);
+					return;
 				}
 				// Non-80: 2xx is sufficient here
 				succeedSession(sess);
