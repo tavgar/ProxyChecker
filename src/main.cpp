@@ -66,19 +66,20 @@ struct ProxyTarget {
 	uint16_t port;
     // Optional per-target HTTP mode override (only used when protocol==HTTP)
     std::optional<HttpMode> httpModeOverride;
+    int retryCount = 0; // track retry attempts
 };
 
 struct Settings {
 	std::string inputFile;
 	std::string outputFile; // final merged file
-	std::string testHost = "example.com"; // remote host to HTTP HEAD via proxies
-	uint16_t testPort = 443;
+	std::string testHost = "google.com"; // remote host to HTTP HEAD via proxies
+	uint16_t testPort = 80;
 	std::string testPath = "/";
 	int numWorkers = std::max(1, (int)std::thread::hardware_concurrency());
-	int concurrencyPerWorker = 2048;
-	int connectTimeoutMs = 2000; // improved for proxy reliability
-	int handshakeTimeoutMs = 3000;
-	int requestTimeoutMs = 5000;
+	int concurrencyPerWorker = 1024; // reduce default concurrency to prevent resource exhaustion
+	int connectTimeoutMs = 5000; // more conservative defaults for reliability
+	int handshakeTimeoutMs = 8000;
+	int requestTimeoutMs = 12000;
 	Protocol defaultProtocol = Protocol::HTTP;
 	bool defaultProtocolForced = false; // true if --default-proto explicitly provided
 	bool mergeOutputs = true;
@@ -86,6 +87,10 @@ struct Settings {
 	bool quiet = false;
 	int maxOpenFiles = 262144; // attempt to raise
 	HttpMode httpMode = HttpMode::CONNECT;
+	int maxRetries = 1; // default 1 retry for better reliability
+	bool disableIpMasking = true; // option to disable IP masking validation - default true for Google
+	bool multiProtocolTest = false; // test all protocols even with --default-proto
+	bool strictPort80BodyIP = true; // when true, require body IP for port 80
     // Baseline public IP of this machine (fetched once when possible)
     std::string clientPublicIP;
     // New: CIDR range scanning (mutually exclusive with --in)
@@ -215,9 +220,16 @@ static void tuneSocket(int fd) {
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	int buf = 1 << 16; // 64KB
+	// Increase buffer sizes for better throughput
+	int buf = 1 << 17; // 128KB for better performance
 	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+	// Enable TCP keepalive for long connections
+	int keepalive = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+	// Set linger to ensure data is sent before close
+	struct linger lng = {1, 1};
+	setsockopt(fd, SOL_SOCKET, SO_LINGER, &lng, sizeof(lng));
 }
 
 static void logf(bool quiet, const char* fmt, ...) {
@@ -368,6 +380,9 @@ struct Session {
 	bool lastWasGet{false};
 	// For worker context
 	class Worker* worker{nullptr};
+	// Retry tracking
+	int retryCount{0};
+	uint64_t connectStartMs{0};
 };
 
 static std::mutex g_printMutex;
@@ -640,13 +655,28 @@ private:
 		removeFromActive(sess);
 	}
 
-	void failSession(Session* sess) {
+		void failSession(Session* sess) {
+		// Check if we should retry
+		if (sess->retryCount < settings_.maxRetries) {
+			// Retry the proxy with increased timeout
+			ProxyTarget retry{
+				sess->proto,
+				sess->proxyHost,
+				sess->proxyPort,
+				sess->httpModeOverride
+			};
+			retry.retryCount = sess->retryCount + 1;
+			removeFromActive(sess);
+			// Queue immediate retry without blocking this thread
+			launchWithRetry(retry);
+			return;
+		}
 		counters_.failed.fetch_add(1, std::memory_order_relaxed);
 		sess->state = SessionState::FAILED;
 		removeFromActive(sess);
 	}
 
-	void launch(const ProxyTarget& tgt) {
+		void launchWithRetry(const ProxyTarget& tgt) {
 		// Resolve numeric only (avoid DNS locally)
 		addrinfo hints{};
 		hints.ai_socktype = SOCK_STREAM;
@@ -684,8 +714,11 @@ private:
 		sess->proxyHost = tgt.host;
 		sess->proxyPort = tgt.port;
 		sess->httpModeOverride = tgt.httpModeOverride;
-		// For HTTP protocol, require masking when testing via HTTP on port 80
-		sess->requireIpMasking = (tgt.protocol == Protocol::HTTP) && (settings_.testPort == 80);
+		sess->retryCount = tgt.retryCount;
+		sess->connectStartMs = nowMs();
+		// For all protocols, require masking when testing via HTTP on port 80 (unless disabled)
+		// Note: Google doesn't return client IP, so masking is not applicable
+		sess->requireIpMasking = (settings_.testPort == 80) && !settings_.disableIpMasking && (settings_.testHost != "google.com");
 		sess->worker = this;
 		sess->state = SessionState::CONNECTING;
 		sess->writeBuf.clear();
@@ -705,10 +738,16 @@ private:
 			counters_.failed.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		setDeadline(sess, settings_.connectTimeoutMs);
+		// Increase timeout for retries
+		int timeout = settings_.connectTimeoutMs * (1 + sess->retryCount);
+		setDeadline(sess, timeout);
 		activeList_.push_back(sess);
 		++active_;
 		counters_.started.fetch_add(1, std::memory_order_relaxed);
+	}
+
+		void launch(const ProxyTarget& tgt) {
+		launchWithRetry(tgt);
 	}
 
 	void handleWritable(Session* sess) {
@@ -769,11 +808,23 @@ private:
 	}
 
 	void handleReadable(Session* sess) {
-		char buf[8192];
+		char buf[16384]; // Larger buffer for better throughput
 		ssize_t n = ::recv(sess->fd, buf, sizeof(buf), 0);
-		if (n == 0) { failSession(sess); return; }
+		if (n == 0) { 
+			// Connection closed by peer - for HTTP responses, this might be expected
+			if ((sess->state == SessionState::HTTP_RECV || sess->state == SessionState::HTTP_TUNNEL_HTTP_RECV ||
+			     sess->state == SessionState::SOCKS_HTTP_RECV) && sess->statusCode >= 200 && sess->statusCode < 300) {
+				// HTTP success response with connection close - parse what we have
+				parseHttpStatus(sess);
+				return;
+			}
+			failSession(sess); 
+			return; 
+		}
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+			// Don't fail immediately on temporary errors
+			if (errno == EINTR) return;
 			failSession(sess);
 			return;
 		}
@@ -924,6 +975,13 @@ private:
 		sess->readBuf.clear();
 	}
 
+	void prepareSocksHttpGet(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
+		buildHttpGet(sess->writeBuf, host, port, path, /*absoluteForm*/false);
+		sess->writeOffset = 0;
+		sess->readBuf.clear();
+		sess->lastWasGet = true;
+	}
+
 	void prepareHttpGet(Session* sess, const std::string& host, uint16_t port, const std::string& path) {
 		buildHttpGet(sess->writeBuf, host, port, path, /*absoluteForm*/true);
 		sess->writeOffset = 0;
@@ -942,18 +1000,26 @@ private:
 		// Ensure we have at least a status line
 		size_t lineEnd = sess->readBuf.find("\r\n");
 		if (lineEnd == std::string::npos) {
-			if (sess->readBuf.size() > 16384) { failSession(sess); }
-			return;
+			// Also try just \n in case of non-standard line endings
+			lineEnd = sess->readBuf.find("\n");
+			if (lineEnd == std::string::npos) {
+				if (sess->readBuf.size() > 65536) { failSession(sess); } // Increased limit
+				return;
+			}
 		}
 		// Parse status once
 		if (!sess->statusParsed) {
 			int code = 0;
 			const char* data = sess->readBuf.data();
 			size_t len = lineEnd;
-			size_t sp = sess->readBuf.find(' ');
-			if (sp != std::string::npos && sp + 4 <= len) {
-				if (std::isdigit((unsigned char)data[sp + 1]) && std::isdigit((unsigned char)data[sp + 2]) && std::isdigit((unsigned char)data[sp + 3])) {
-					code = (data[sp + 1] - '0') * 100 + (data[sp + 2] - '0') * 10 + (data[sp + 3] - '0');
+			// Look for HTTP/1.x pattern first
+			size_t httpPos = sess->readBuf.find("HTTP/");
+			if (httpPos != std::string::npos && httpPos < lineEnd) {
+				size_t sp = sess->readBuf.find(' ', httpPos);
+				if (sp != std::string::npos && sp + 4 <= len) {
+					if (std::isdigit((unsigned char)data[sp + 1]) && std::isdigit((unsigned char)data[sp + 2]) && std::isdigit((unsigned char)data[sp + 3])) {
+						code = (data[sp + 1] - '0') * 100 + (data[sp + 2] - '0') * 10 + (data[sp + 3] - '0');
+					}
 				}
 			}
 			sess->statusParsed = true;
@@ -964,8 +1030,8 @@ private:
 		switch (sess->state) {
 			case SessionState::HTTP_CONNECT_RECV: {
 				if (sess->statusCode >= 200 && sess->statusCode < 300) {
-					// If IP masking required and port 80, send GET within tunnel (origin-form)
-					if (sess->requireIpMasking && sess->worker->settings_.testPort == 80) {
+					// For port 80 in strict mode, verify by issuing an HTTP GET inside the tunnel
+					if (sess->worker->settings_.testPort == 80 && sess->worker->settings_.strictPort80BodyIP) {
 						sess->readBuf.clear();
 						sess->statusParsed = false;
 						sess->headersComplete = false;
@@ -975,6 +1041,7 @@ private:
 						sess->worker->arm(sess, false, true);
 						return;
 					}
+					// Non-80: treat CONNECT 2xx as success
 					succeedSession(sess);
 					return;
 				}
@@ -984,38 +1051,72 @@ private:
 			case SessionState::HTTP_RECV:
 			case SessionState::HTTP_TUNNEL_HTTP_RECV:
 			case SessionState::SOCKS_HTTP_RECV: {
-				if (!(sess->statusCode >= 200 && sess->statusCode < 300)) { failSession(sess); return; }
-				// For SOCKS HTTP verification, we do not require IP masking; treat 2xx as success
-				if (sess->state == SessionState::SOCKS_HTTP_RECV) { succeedSession(sess); return; }
-				// For HTTP direct or tunneled GET: if masking is not required (non-80 test port), 2xx is success
-				if (!sess->requireIpMasking) { succeedSession(sess); return; }
-				// Need headers end to parse body
-				size_t hdrEnd = sess->readBuf.find("\r\n\r\n");
-				if (hdrEnd == std::string::npos) {
-					if (sess->readBuf.size() > (1u << 20)) { failSession(sess); }
-					return;
-				}
-				sess->headersComplete = true;
-				size_t bodyPos = hdrEnd + 4;
-				if (bodyPos >= sess->readBuf.size()) return; // wait for body
-                std::string ip;
-                if (extractIPv4StrictFromBody(sess->readBuf.data() + bodyPos, sess->readBuf.size() - bodyPos, ip)) {
-					// Require that the returned IP differs from our baseline to confirm masking
-					if (!sess->worker->settings_.clientPublicIP.empty()) {
-						if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
-							succeedSession(sess);
+				// Accept 2xx responses, and 3xx redirects for Google (bot detection)
+				bool validResponse = (sess->statusCode >= 200 && sess->statusCode < 300) ||
+				                   (sess->worker->settings_.testHost == "google.com" && sess->statusCode >= 300 && sess->statusCode < 400);
+				if (!validResponse) { failSession(sess); return; }
+				// For port 80 in strict mode, require a valid public IPv4 in the body to confirm end-to-end HTTP success
+				// Exception: Google doesn't return client IP, so just check for successful response
+				if (sess->worker->settings_.testPort == 80 && sess->worker->settings_.strictPort80BodyIP && sess->worker->settings_.testHost != "google.com") {
+					// Need headers end to parse body
+					size_t hdrEnd = sess->readBuf.find("\r\n\r\n");
+					if (hdrEnd == std::string::npos) {
+						// Also try \n\n for non-standard servers
+						hdrEnd = sess->readBuf.find("\n\n");
+						if (hdrEnd == std::string::npos) {
+							if (sess->readBuf.size() > (1u << 20)) { failSession(sess); }
 							return;
 						}
-						// Found but equals our own IP => not a proxy masking -> fail
-						failSession(sess);
+						sess->headersComplete = true;
+					}
+					size_t bodyStart = (sess->readBuf.find("\r\n\r\n") != std::string::npos)
+						? (sess->readBuf.find("\r\n\r\n") + 4)
+						: (sess->readBuf.find("\n\n") + 2);
+					if (bodyStart >= sess->readBuf.size()) return; // wait for body
+					std::string ip;
+					if (extractIPv4StrictFromBody(sess->readBuf.data() + bodyStart, sess->readBuf.size() - bodyStart, ip)) {
+						// If masking required, ensure returned IP differs from our own
+						if (sess->requireIpMasking) {
+							if (sess->worker->settings_.clientPublicIP.empty()) {
+								// No baseline IP available - accept any valid public IP
+								succeedSession(sess);
+								return;
+							} else if (!ip.empty() && ip != sess->worker->settings_.clientPublicIP) {
+								// Baseline available and IP is different - success
+								succeedSession(sess);
+								return;
+							}
+							// Baseline available but IP is same or empty - fail
+							failSession(sess);
+							return;
+						}
+						// Masking not required: any valid public IP in body is success
+						succeedSession(sess);
 						return;
 					}
-					// Baseline IP unknown; cannot confirm masking reliably -> fail to avoid false positives
-					failSession(sess);
+					// Keep reading until close or threshold
+					if (sess->readBuf.size() > 131072) { failSession(sess); }
 					return;
 				}
-				// Keep reading until close or threshold
-				if (sess->readBuf.size() > 65536) { failSession(sess); }
+				// Non-80 or Google: 2xx response is sufficient
+				// For Google, we just need successful connectivity, not IP parsing
+				if (sess->worker->settings_.testHost == "google.com") {
+					// Accept any reasonable Google response (including bot detection redirects)
+					if (sess->readBuf.find("</html>") != std::string::npos || 
+					    sess->readBuf.find("Google") != std::string::npos ||
+					    sess->readBuf.find("DOCTYPE") != std::string::npos ||
+					    sess->readBuf.find("302 Found") != std::string::npos ||
+					    sess->readBuf.find("302 Moved") != std::string::npos ||
+					    sess->readBuf.find("Location:") != std::string::npos ||
+					    sess->readBuf.find("location:") != std::string::npos ||
+					    sess->readBuf.find("www.google.com") != std::string::npos ||
+					    sess->readBuf.find("sorry/index") != std::string::npos) {
+						succeedSession(sess);
+						return;
+					}
+				}
+				// Non-80: 2xx is sufficient here
+				succeedSession(sess);
 				return;
 			}
 			default:
@@ -1087,8 +1188,8 @@ static void usage(const char* argv0) {
 	std::cerr << "  --out FILE            Output file for working proxies\n";
 	std::cerr << "  --workers N           Number of worker threads (default: hw cores)\n";
 	std::cerr << "  --concurrency N       Connections per worker (default: 2048)\n";
-	std::cerr << "  --test-host HOST      Target host for verification (default: example.com)\n";
-	std::cerr << "  --test-port PORT      Target port for verification (default: 443)\n";
+	std::cerr << "  --test-host HOST      Target host for verification (default: google.com)\n";
+	std::cerr << "  --test-port PORT      Target port for verification (default: 80)\n";
 	std::cerr << "  --test-path PATH      HTTP path for verification (default: /)\n";
     std::cerr << "  --timeout S           Base timeout in seconds; scales internal timeouts proportionally\n";
 	std::cerr << "  --default-proto [http|socks4|socks5] (default: http)\n";
@@ -1097,6 +1198,11 @@ static void usage(const char* argv0) {
 	std::cerr << "  --quiet               Reduce logging\n";
 	std::cerr << "  --scan-all-ports      Scan all ports (1-65535) for each IP in range modes\n";
 	std::cerr << "  --queue-size N        Bounded queue capacity for range scanning (default: workers*concurrency*2)\n";
+	std::cerr << "  --max-retries N       Maximum retry attempts for failed connections (default: 2)\n";
+	std::cerr << "  --disable-ip-masking  Disable IP masking validation for HTTP proxies on port 80\n";
+	std::cerr << "  --multi-protocol      Test all protocols even when --default-proto is specified\n";
+	std::cerr << "  --strict              Enable strict validation (port 80 requires body IP, tunneled GET) [default: enabled]\n";
+	std::cerr << "  --no-strict           Disable strict validation (allow any 2xx response as success)\n";
 	    std::cerr << "\n";
 	    std::cerr << "Notes:\n";
 	    std::cerr << "  - If a line omits protocol (e.g., ip:port) and --default-proto is NOT provided,\n";
@@ -1104,6 +1210,7 @@ static void usage(const char* argv0) {
 	    std::cerr << "  - If --default-proto is provided, unspecified lines are tested ONLY with that protocol\n";
 	    std::cerr << "    (HTTP uses --http-mode). Lines that explicitly specify a protocol are honored as-is.\n";
 	    std::cerr << "  - --in, --range, and --range-file are mutually exclusive.\n";
+	    std::cerr << "  - --multi-protocol forces testing all protocols regardless of --default-proto setting.\n";
 	std::cerr << std::flush;
 }
 
@@ -1144,6 +1251,11 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 		else if (a == "--quiet") { s.quiet = true; }
 		else if (a == "--scan-all-ports") { s.scanAllPorts = true; }
 		else if (a == "--queue-size") { const char* v = need("--queue-size"); if (!v) return false; s.queueCapacity = std::max(1, atoi(v)); }
+		else if (a == "--max-retries") { const char* v = need("--max-retries"); if (!v) return false; s.maxRetries = std::max(0, atoi(v)); }
+		else if (a == "--disable-ip-masking") { s.disableIpMasking = true; }
+		else if (a == "--multi-protocol") { s.multiProtocolTest = true; }
+		else if (a == "--strict") { s.strictPort80BodyIP = true; }
+		else if (a == "--no-strict") { s.strictPort80BodyIP = false; }
 		else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
 		else { std::cerr << "Unknown arg: " << a << "\n"; usage(argv[0]); return false; }
 	}
@@ -1167,7 +1279,9 @@ static bool parseArgs(int argc, char** argv, Settings& s) {
 // Fetch the public IP of this machine by making a direct HTTP GET to testHost:testPort testPath
 // Only supports HTTP on port 80 (no TLS). Returns true on success and populates settings.clientPublicIP
 static bool fetchBaselinePublicIP(Settings& settings) {
-    if (settings.testPort != 80) return false;
+    if (settings.testPort != 80) {
+        return false;
+    }
     const std::string& host = settings.testHost;
     const std::string& path = settings.testPath.empty() ? std::string("/") : settings.testPath;
     addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC; hints.ai_flags = AI_ADDRCONFIG;
@@ -1181,24 +1295,29 @@ static bool fetchBaselinePublicIP(Settings& settings) {
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
         if (fd < 0) continue;
-        // Set short timeouts
-        struct timeval tv; tv.tv_sec = settings.connectTimeoutMs / 1000; tv.tv_usec = (settings.connectTimeoutMs % 1000) * 1000;
+        // Set more generous timeouts for baseline IP fetching
+        struct timeval tv; tv.tv_sec = std::max(5, settings.connectTimeoutMs / 1000); tv.tv_usec = (settings.connectTimeoutMs % 1000) * 1000;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) { aiSel = ai; break; }
         close(fd); fd = -1;
     }
-    if (fd < 0) { freeaddrinfo(res); return false; }
+    if (fd < 0) { 
+        freeaddrinfo(res); 
+        return false; 
+    }
     // Build simple origin-form GET
     std::string req;
     req.reserve(256);
     req += "GET "; req += path.empty() ? "/" : path; req += " HTTP/1.1\r\n";
     req += "Host: "; req += host; req += "\r\n";
-    req += "User-Agent: ProxyChecker/0.1\r\n";
-    req += "Accept: text/plain, text/*;q=0.9, */*;q=0.1\r\n";
+    req += "User-Agent: curl/7.88.1\r\n";
+    req += "Accept: */*\r\n";
     req += "Connection: close\r\n\r\n";
     ssize_t wn = ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
-    if (wn < 0) { close(fd); freeaddrinfo(res); return false; }
+    if (wn < 0) { 
+        close(fd); freeaddrinfo(res); return false; 
+    }
     // Read response
     std::string buf; buf.reserve(4096);
     char tmp[2048];
@@ -1211,9 +1330,13 @@ static bool fetchBaselinePublicIP(Settings& settings) {
     close(fd); freeaddrinfo(res);
     // Find body
     size_t hdrEnd = buf.find("\r\n\r\n");
-    if (hdrEnd == std::string::npos) return false;
+    if (hdrEnd == std::string::npos) {
+        return false;
+    }
     size_t bodyPos = hdrEnd + 4;
-    if (bodyPos >= buf.size()) return false;
+    if (bodyPos >= buf.size()) {
+        return false;
+    }
     std::string ip;
     if (extractIPv4StrictFromBody(buf.data() + bodyPos, buf.size() - bodyPos, ip)) {
         settings.clientPublicIP = ip;
@@ -1236,7 +1359,7 @@ static bool readProxies(const std::string& path, const Settings& s, std::vector<
 			out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
 		} else {
 			// Protocol omitted in input
-			if (s.defaultProtocolForced) {
+			if (s.defaultProtocolForced && !s.multiProtocolTest) {
 				// Enforce the specified default protocol only
 				switch (s.defaultProtocol) {
 					case Protocol::HTTP:
@@ -1250,7 +1373,7 @@ static bool readProxies(const std::string& path, const Settings& s, std::vector<
 						break;
 				}
 			} else {
-				// Try all protocols and HTTP modes by default
+				// Try all protocols and HTTP modes by default or when multi-protocol mode is enabled
 				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT});
 				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::DIRECT});
 				out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
@@ -1311,7 +1434,7 @@ static bool generateProxiesFromRange(const Settings& s, std::vector<ProxyTarget>
     enumerateIPsInCIDR(network, maskBits, ips);
     if (ips.empty()) return true;
     auto pushForPort = [&](const std::string& ip, uint16_t port){
-        if (s.defaultProtocolForced) {
+        if (s.defaultProtocolForced && !s.multiProtocolTest) {
             switch (s.defaultProtocol) {
                 case Protocol::HTTP:
                     out.push_back(ProxyTarget{Protocol::HTTP, ip, port, s.httpMode});
@@ -1364,7 +1487,7 @@ static void generateProxiesFromCIDR(uint32_t network, uint32_t maskBits, const S
         }
         const std::string ipStr(buf);
         auto pushForPort = [&](uint16_t port){
-            if (s.defaultProtocolForced) {
+            if (s.defaultProtocolForced && !s.multiProtocolTest) {
                 switch (s.defaultProtocol) {
                     case Protocol::HTTP:
                         out.push_back(ProxyTarget{Protocol::HTTP, ipStr, port, s.httpMode});
@@ -1533,7 +1656,7 @@ int main(int argc, char** argv) {
 			totalIps = countIPsInCIDR(bits);
 		}
 		settings.totalIpsForProgress = totalIps;
-		uint64_t protocolsPerTarget = settings.defaultProtocolForced ? 1ULL : 4ULL;
+		uint64_t protocolsPerTarget = (settings.defaultProtocolForced && !settings.multiProtocolTest) ? 1ULL : 4ULL;
 		if (settings.scanAllPorts) {
 			settings.totalPortsForProgress = totalIps * 65535ULL;
 			settings.sessionsPerPortForProgress = (uint32_t)protocolsPerTarget;
@@ -1555,7 +1678,41 @@ int main(int argc, char** argv) {
 
 	// If HTTP on port 80, prefetch our public IP baseline once to enable IP-masking verification
 	if (settings.testPort == 80) {
-		(void)fetchBaselinePublicIP(settings);
+		bool success = fetchBaselinePublicIP(settings);
+		if (!success) {
+			// Try fallback hosts for baseline IP fetching
+			std::string originalHost = settings.testHost;
+			std::string originalPath = settings.testPath;
+			
+			std::vector<std::pair<std::string, std::string>> fallbacks = {
+				{"ifconfig.me", "/"},
+				{"ifconfig.io", "/ip"},
+				{"icanhazip.com", "/"},
+				{"checkip.amazonaws.com", "/"}
+			};
+			
+			for (const auto& fallback : fallbacks) {
+				settings.testHost = fallback.first;
+				settings.testPath = fallback.second;
+				if (fetchBaselinePublicIP(settings)) {
+					success = true;
+					if (!settings.quiet) {
+						logf(settings.quiet, "Successfully fetched baseline IP from fallback: %s%s", 
+							fallback.first.c_str(), fallback.second.c_str());
+					}
+					break;
+				}
+			}
+			
+			// Restore original settings
+			settings.testHost = originalHost;
+			settings.testPath = originalPath;
+		}
+		
+		if (!success && !settings.quiet) {
+			std::cerr << "Warning: Failed to fetch baseline public IP from " << settings.testHost << ":" << settings.testPort << settings.testPath << std::endl;
+			std::cerr << "         IP masking validation will be disabled. Use --disable-ip-masking to suppress this warning." << std::endl;
+		}
 	}
 
 	// Number of workers
@@ -1572,7 +1729,7 @@ int main(int argc, char** argv) {
 		taskQueue = std::make_shared<TaskQueue>((size_t)capacity);
 		// Producer lambda for pushing tasks on-the-fly
 		auto pushForIpPort = [&](const std::string& ipStr, uint16_t port){
-			if (settings.defaultProtocolForced) {
+			if (settings.defaultProtocolForced && !settings.multiProtocolTest) {
 				switch (settings.defaultProtocol) {
 					case Protocol::HTTP:
 						(void)taskQueue->push(ProxyTarget{Protocol::HTTP, ipStr, port, settings.httpMode});

@@ -1,3 +1,38 @@
-*.txt
+# Build artifacts
 proxychecker
-build/*
+build/
+*.o
+*.obj
+*.exe
+*.out
+*.app
+
+# Output files (proxy lists, results, logs)
+*.txt
+*.txt.*
+*.log
+*.csv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Core dumps
+core
+core.*
+
+# Backup files
+*.bak
+*.backup
