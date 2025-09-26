@@ -13,11 +13,11 @@ A blazing-fast, `epoll`-based, multi-threaded proxy checker written in C++20.
 
 * Verification model:
 
-  * HTTP proxies: validate via HTTP CONNECT to the target (default: 443). When using a cleartext test service on port 80 (e.g., `ifconfig.io`), the checker performs an HTTP GET through the proxy and requires that the returned public IP differs from the client's baseline IP to avoid false positives.
+  * HTTP proxies: validate via HTTP CONNECT to the target (default: google.com:80). For cleartext test services on port 80, the checker performs an HTTP GET through the proxy. When using services that return client IP (like `ifconfig.io`), it requires the returned public IP differs from the client's baseline IP to avoid false positives.
   * SOCKS4/5: perform CONNECT to the target; if the target is port 80, send an HTTP HEAD request
-* Supports HTTP, SOCKS4, SOCKS5
+* Supports HTTP, SOCKS4, SOCKS5 with automatic retry mechanism
 * Highly parallel with per-thread `epoll` and sharded inputs
-* Aggressive timeouts and socket tuning for speed
+* Conservative timeouts (5s/8s/12s) and enhanced socket tuning for reliability
 
 ## Build
 
@@ -30,7 +30,7 @@ make -C ProxyChecker -j
 **Theoretically**, you can scan the entire Internet searching for public proxies:
 
 ```bash
-./proxychecker --range 0.0.0.0/0 --workers 12 --concurrency 500000 --timeout 20 --scan-all-ports
+./proxychecker --range 0.0.0.0/0 --workers 12 --concurrency 100000 --timeout 20 --scan-all-ports
 ```
 
 ## Usage
@@ -38,15 +38,15 @@ make -C ProxyChecker -j
 ```bash
 # From a list file
 ./proxychecker --in proxies.txt --out good.txt \
-  --workers 8 --concurrency 4096 \
-  --test-host ifconfig.io --test-port 443 --test-path / \
-  --timeout 2 \
+  --workers 8 --concurrency 1024 \
+  --test-host google.com --test-port 80 --test-path / \
+  --timeout 5 \
   --default-proto http --http-mode connect
 
 # Scan an IP range in CIDR on common proxy ports
 ./proxychecker --range 104.20.15.0/24 --out good_from_range.txt \
-  --workers 8 --concurrency 4096 \
-  --timeout 2
+  --workers 8 --concurrency 1024 \
+  --timeout 5
 
 # Scan multiple CIDR ranges from a file
 # range_list.txt (example):
@@ -56,35 +56,67 @@ make -C ProxyChecker -j
 # 109.224.208.0/21
 # 109.238.144.0/20
 ./proxychecker --range-file range_list.txt --out good_from_ranges.txt \
-  --workers 8 --concurrency 4096 \
-  --timeout 2
+  --workers 8 --concurrency 1024 \
+  --timeout 5
 
 # Scan all ports (1–65535) for each IP in a range
 ./proxychecker --range 10.0.0.0/30 --scan-all-ports --out good_full_scan.txt \
-  --workers 12 --concurrency 50000 --timeout 5
+  --workers 12 --concurrency 25000 --timeout 5
 
 # Example: scan ranges from a file across all ports with custom worker/concurrency
-./proxychecker --range-file 212.txt --scan-all-ports --workers 12 --concurrency 50000 --timeout 5 --out good_full_scan_from_file.txt
+./proxychecker --range-file 212.txt --scan-all-ports --workers 12 --concurrency 25000 --timeout 5 --out good_full_scan_from_file.txt
+
+# Use retry mechanism for better reliability
+./proxychecker --in proxies.txt --out good.txt \
+  --max-retries 2 --timeout 8
+
+# Test all protocols even when default is specified
+./proxychecker --in proxies.txt --out good.txt \
+  --default-proto http --multi-protocol
+
+# Disable strict IP masking validation (useful for Google and other hosts)
+./proxychecker --in proxies.txt --out good.txt \
+  --test-host google.com --disable-ip-masking
 ```
 
-### HTTP proxy validation and masking on port 80
+### HTTP proxy validation and reliability features
 
-When verifying HTTP proxies against a cleartext test service on port 80 (for example, `--test-host ifconfig.io --test-port 80 --test-path /`), the checker performs a second-stage validation to ensure the endpoint is a real proxy that forwards traffic and masks your IP:
+When verifying HTTP proxies against test services on port 80 (default: `--test-host google.com --test-port 80`), the checker includes several reliability enhancements:
 
-- It first establishes the proxy (HTTP CONNECT if applicable).
-- It then sends an HTTP GET to the test service through the proxy.
-- It extracts the first IPv4 address from the response body and compares it to the client’s own baseline public IP, which is fetched directly (without proxy) from the same test service.
-- The proxy is considered valid only if the response contains an IP and it differs from the baseline IP.
-- If the baseline IP cannot be determined, the tool fails such sessions to avoid false positives.
+#### IP Masking Validation (for IP-returning services)
+For test services that return client IP (like `ifconfig.io`), the checker performs enhanced validation:
+- Establishes the proxy connection (HTTP CONNECT if applicable)
+- Sends an HTTP GET to the test service through the proxy
+- Extracts the first IPv4 address from the response body and compares it to the client's baseline public IP
+- The proxy is considered valid only if the response contains an IP that differs from the baseline IP
+- Supports fallback IP services (`ifconfig.me`, `ifconfig.io`, `icanhazip.com`, `checkip.amazonaws.com`) if primary service fails
 
-Example usage for range scans with masking validation on port 80:
+#### Google.com Compatibility
+Google.com (default test host) doesn't return client IP, so the checker:
+- Accepts any successful HTTP response (2xx/3xx) as validation
+- Handles bot detection redirects gracefully
+- Uses `--disable-ip-masking` automatically for google.com
+
+#### Retry Mechanism
+- Automatic retry with increased timeouts for failed connections
+- Configurable with `--max-retries N` (default: 1)
+- Helps handle temporary network issues and rate limiting
+
+Example usage with enhanced reliability:
 
 ```bash
+# Standard Google validation (no IP masking needed)
 ./proxychecker --range-file ipranges.txt \
-  --workers 4 --concurrency 20000 \
-  --timeout 2 \
-  --out good.txt \
-  --test-host ifconfig.io --test-port 80 --test-path /
+  --workers 4 --concurrency 10000 \
+  --timeout 5 --max-retries 2 \
+  --out good.txt
+
+# IP masking validation with ifconfig.io
+./proxychecker --range-file ipranges.txt \
+  --workers 4 --concurrency 10000 \
+  --timeout 5 --max-retries 1 \
+  --test-host ifconfig.io --test-port 80 \
+  --out good.txt
 ```
 
 ## Streaming generation for range scans
@@ -120,26 +152,65 @@ When using `--range` or `--range-file`, tasks are generated on the fly and fed t
 * Successful proxies are printed immediately, e.g., `Found: http://1.2.3.4:8080`.
 * A dynamic progress bar updates counts of checked, succeeded, and failed proxies.
 
-**Behavior when protocol is omitted:**
+**Protocol handling and new options:**
 
-* If a line is `ip:port` without a protocol, the checker will try all supported protocols and HTTP methods for that endpoint in parallel:
-
+* **Default behavior**: If a line is `ip:port` without a protocol, the checker tries all supported protocols and HTTP methods for that endpoint in parallel:
   * HTTP CONNECT
   * HTTP DIRECT (absolute-form HEAD request)
   * SOCKS5 CONNECT
   * SOCKS4 CONNECT
-* In this case, the `--default-proto` flag is ignored for that line.
-* If the input specifies a protocol explicitly (`http://`, `socks4://`, `socks5://` or trailing `,proto`), only that protocol is attempted. For HTTP with an explicit protocol, the HTTP mode is controlled by `--http-mode` (default `connect`).
 
-**Notes on correctness:**
+* **With `--default-proto`**: Only the specified protocol is tested for lines without explicit protocol
 
-* Plain web servers on port 80/443 may respond to raw HTTP but are not proxies.
-* Using CONNECT to port 443 avoids false positives by requiring proxy tunneling support.
+* **With `--multi-protocol`**: Forces testing all protocols even when `--default-proto` is specified
+
+* **Explicit protocol**: Lines with explicit protocol (`http://`, `socks4://`, `socks5://` or `,proto`) use only that protocol
+
+**New CLI options for enhanced control:**
+
+* `--max-retries N`: Maximum retry attempts for failed connections (default: 1)
+* `--disable-ip-masking`: Disable IP masking validation (useful for Google, default for google.com)
+* `--multi-protocol`: Test all protocols regardless of `--default-proto` setting
+* `--strict`: Enable strict validation requiring body IP for port 80 (default: enabled)
+* `--no-strict`: Accept any 2xx response as success, disable strict validation
+
+**Notes on correctness and reliability:**
+
+* Plain web servers on port 80/443 may respond to raw HTTP but are not proxies
+* The tool now uses conservative timeouts (5s/8s/12s) instead of aggressive ones for better reliability
+* Reduced default concurrency (1024 vs 2048) prevents resource exhaustion under load
+* Enhanced buffer management (128KB) and TCP keepalive improve connection stability
+* Automatic retry mechanism handles temporary failures and rate limiting
+* Google.com testing provides reliable connectivity validation without IP masking requirements
+
+---
+
+## Repository and Build
+
+**Clean repository structure:**
+* Enhanced `.gitignore` prevents build artifacts, output files, and temporary files from being tracked
+* Build artifacts (`proxychecker` binary, `build/` directory) are automatically excluded
+* Output files (`*.txt`, `*.log`) and IDE files are ignored
+* Use `make clean` to remove all build artifacts
+
+**Build requirements:**
+* C++20 compatible compiler (GCC recommended)
+* Linux with `epoll` support
+* Make utility
+
+```bash
+# Clean build
+make clean && make -j
+
+# Build with custom optimization
+CXXFLAGS="-O2 -g" make
+```
 
 ---
 
 ## Notes
 
-* Only numeric IPs are resolved currently to avoid DNS overhead. Add hostnames with caution.
-* Requires a high `ulimit -n`; the program attempts to raise it automatically.
-* Designed for Linux with `epoll`.
+* Only numeric IPs are resolved currently to avoid DNS overhead. Add hostnames with caution
+* Requires a high `ulimit -n`; the program attempts to raise it automatically
+* Designed for Linux with `epoll`
+* Recent improvements focus on reliability over raw speed, with conservative timeouts and retry mechanisms
