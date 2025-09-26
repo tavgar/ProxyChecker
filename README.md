@@ -13,7 +13,7 @@ A blazing-fast, `epoll`-based, multi-threaded proxy checker written in C++20.
 
 * Verification model:
 
-  * HTTP proxies: validate via HTTP CONNECT to the target (default: google.com:80). For cleartext test services on port 80, the checker performs an HTTP GET through the proxy. When using services that return client IP (like `ifconfig.io`), it requires the returned public IP differs from the client's baseline IP to avoid false positives.
+  * HTTP proxies: validate via HTTP CONNECT to the target (default: google.com:80 - the most reliable test host). For cleartext test services on port 80, the checker performs an HTTP GET through the proxy. When using services that return client IP (like `ifconfig.io`), it requires the returned public IP differs from the client's baseline IP to avoid false positives.
   * SOCKS4/5: perform CONNECT to the target; if the target is port 80, send an HTTP HEAD request
 * Supports HTTP, SOCKS4, SOCKS5 with automatic retry mechanism
 * Highly parallel with per-thread `epoll` and sharded inputs
@@ -91,11 +91,12 @@ For test services that return client IP (like `ifconfig.io`), the checker perfor
 - The proxy is considered valid only if the response contains an IP that differs from the baseline IP
 - Supports fallback IP services (`ifconfig.me`, `ifconfig.io`, `icanhazip.com`, `checkip.amazonaws.com`) if primary service fails
 
-#### Google.com Compatibility
-Google.com (default test host) doesn't return client IP, so the checker:
+#### Google.com Compatibility (Most Reliable Default)
+Google.com is the default test host because it's the most reliable and globally available service. It doesn't return client IP, so the checker:
 - Accepts any successful HTTP response (2xx/3xx) as validation
 - Handles bot detection redirects gracefully
 - Uses `--disable-ip-masking` automatically for google.com
+- Provides consistent global availability and minimal downtime
 
 #### Retry Mechanism
 - Automatic retry with increased timeouts for failed connections
@@ -181,7 +182,7 @@ When using `--range` or `--range-file`, tasks are generated on the fly and fed t
 * Reduced default concurrency (1024 vs 2048) prevents resource exhaustion under load
 * Enhanced buffer management (128KB) and TCP keepalive improve connection stability
 * Automatic retry mechanism handles temporary failures and rate limiting
-* Google.com testing provides reliable connectivity validation without IP masking requirements
+* Google.com testing (default) provides the most reliable connectivity validation worldwide without IP masking requirements
 
 ---
 
