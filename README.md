@@ -34,6 +34,22 @@ make -C ProxyChecker -j
 ```
 
 ## Usage
+### Basic
+#### For a range:
+```
+./proxychecker --range 192.168.0.1/18 --out good.txt
+```
+#### For a list
+```
+./proxychecker --in proxies_list.txt --out good.txt
+```
+#### For a list of ranges
+
+```
+./proxychecker --range-file proxies_list.txt --out good.txt
+```
+
+### Advanced options
 
 ```bash
 # From a list file
