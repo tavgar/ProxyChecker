@@ -29,3 +29,9 @@ clean:
 format:
 	@command -v clang-format >/dev/null 2>&1 && clang-format -i $(SRCS) || echo "clang-format not found; skipping"
 
+.PHONY: test
+
+test: $(APP_NAME)
+	@echo Running local proxy tests...
+	python3 Tests/test_local_proxies.py || (echo "Tests failed" && exit 1)
+

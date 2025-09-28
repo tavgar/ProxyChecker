@@ -36,3 +36,4 @@ core.*
 # Backup files
 *.bak
 *.backup
+Tests/__pycache__/**

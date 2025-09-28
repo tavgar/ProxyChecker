@@ -179,15 +179,12 @@ When using `--range` or `--range-file`, tasks are generated on the fly and fed t
 
 * **With `--default-proto`**: Only the specified protocol is tested for lines without explicit protocol
 
-* **With `--multi-protocol`**: Forces testing all protocols even when `--default-proto` is specified
-
 * **Explicit protocol**: Lines with explicit protocol (`http://`, `socks4://`, `socks5://` or `,proto`) use only that protocol
 
 **New CLI options for enhanced control:**
 
 * `--max-retries N`: Maximum retry attempts for failed connections (default: 1)
 * `--disable-ip-masking`: Disable IP masking validation (useful for Google, default for google.com)
-* `--multi-protocol`: Test all protocols regardless of `--default-proto` setting
 * `--strict`: Enable strict validation requiring body IP for port 80 (default: enabled)
 * `--no-strict`: Accept any 2xx response as success, disable strict validation
 

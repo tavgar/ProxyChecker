@@ -67,6 +67,8 @@ struct ProxyTarget {
     // Optional per-target HTTP mode override (only used when protocol==HTTP)
     std::optional<HttpMode> httpModeOverride;
     int retryCount = 0; // track retry attempts
+    // Optional override for test port (destination port of CONNECT / SOCKS target)
+    std::optional<uint16_t> testPortOverride;
 };
 
 struct Settings {
@@ -266,6 +268,8 @@ struct ParsedProxyLine {
 	uint16_t port{0};
 	Protocol proto{Protocol::HTTP};
 	bool explicitProto{false};
+    // True when input explicitly used https:// or trailing ,https (treated as HTTP with CONNECT)
+    bool httpsScheme{false};
 };
 
 static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& line, Protocol defaultProto) {
@@ -275,6 +279,7 @@ static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& 
 
 	Protocol proto = defaultProto;
 	bool explicitProto = false;
+	bool httpsScheme = false;
 	std::string hostport;
 	// Allow protocol://host:port
 	if (s.rfind("socks5://", 0) == 0) {
@@ -289,6 +294,12 @@ static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& 
 		proto = Protocol::HTTP;
 		explicitProto = true;
 		hostport = s.substr(7);
+	} else if (s.rfind("https://", 0) == 0) {
+		// Treat https proxies as HTTP proxies accessed with CONNECT
+		proto = Protocol::HTTP;
+		explicitProto = true;
+		httpsScheme = true;
+		hostport = s.substr(8);
 	} else {
 		hostport = s;
 	}
@@ -301,7 +312,8 @@ static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& 
 			hostport = trim(hostport.substr(0, comma));
 			if (p == "socks5") { proto = Protocol::SOCKS5; explicitProto = true; }
 			else if (p == "socks4") { proto = Protocol::SOCKS4; explicitProto = true; }
-			else if (p == "http") { proto = Protocol::HTTP; explicitProto = true; }
+			else if (p == "http") { proto = Protocol::HTTP; explicitProto = true; httpsScheme = false; }
+			else if (p == "https") { proto = Protocol::HTTP; explicitProto = true; httpsScheme = true; }
 		}
 	}
 
@@ -326,7 +338,7 @@ static std::optional<ParsedProxyLine> parseProxyLineDetailed(const std::string& 
 		if (host.empty() || portStr.empty()) return std::nullopt;
 		uint16_t port = 0;
 		if (!parseUint16(portStr, port)) return std::nullopt;
-		return ParsedProxyLine{host, port, proto, explicitProto};
+		return ParsedProxyLine{host, port, proto, explicitProto, httpsScheme};
 	}
 }
 
@@ -367,6 +379,8 @@ struct Session {
 	uint16_t proxyPort{0};
     std::optional<HttpMode> httpModeOverride; // honored when proto==HTTP
 	bool requireIpMasking{false}; // for HTTP proxies when validating via testHost on port 80
+    // Effective test destination port for this session (defaults to settings_.testPort)
+    uint16_t effectiveTestPort{0};
 	// Buffers
 	std::string writeBuf;
 	std::string readBuf;
@@ -649,7 +663,10 @@ private:
 		}
 		{
 			std::lock_guard<std::mutex> lock(g_printMutex);
-			std::cout << "Found: " << protocolToString(sess->proto) << "://" << sess->proxyHost << ":" << sess->proxyPort << std::endl;
+			// Clear the current progress line, print the found message, then continue
+			fprintf(stderr, "\r%*s\r", 120, ""); // Clear the line with spaces
+			fprintf(stderr, "Found: %s://%s:%u\n", protocolToString(sess->proto), sess->proxyHost.c_str(), sess->proxyPort);
+			fflush(stderr);
 		}
 		sess->state = SessionState::DONE;
 		removeFromActive(sess);
@@ -716,9 +733,11 @@ private:
 		sess->httpModeOverride = tgt.httpModeOverride;
 		sess->retryCount = tgt.retryCount;
 		sess->connectStartMs = nowMs();
-		// For all protocols, require masking when testing via HTTP on port 80 (unless disabled)
+        // Determine effective test port for this session
+        sess->effectiveTestPort = tgt.testPortOverride.has_value() ? *tgt.testPortOverride : settings_.testPort;
+        // For all protocols, require masking when testing via HTTP on port 80 (unless disabled)
 		// Note: Google doesn't return client IP, so masking is not applicable
-		sess->requireIpMasking = (settings_.testPort == 80) && !settings_.disableIpMasking && (settings_.testHost != "google.com");
+        sess->requireIpMasking = (sess->effectiveTestPort == 80) && !settings_.disableIpMasking && (settings_.testHost != "google.com");
 		sess->worker = this;
 		sess->state = SessionState::CONNECTING;
 		sess->writeBuf.clear();
@@ -760,21 +779,37 @@ private:
 			// Connected
 				switch (sess->proto) {
 				case Protocol::HTTP: {
-					HttpMode mode = sess->httpModeOverride.has_value() ? *sess->httpModeOverride : settings_.httpMode;
-						bool useConnect = (mode == HttpMode::CONNECT) || (settings_.testPort != 80);
+                    HttpMode mode = sess->httpModeOverride.has_value() ? *sess->httpModeOverride : settings_.httpMode;
+                        bool useConnect = (mode == HttpMode::CONNECT) || (sess->effectiveTestPort != 80);
 					if (useConnect) {
-						prepareHttpConnect(sess, settings_.testHost, settings_.testPort);
+                        prepareHttpConnect(sess, settings_.testHost, sess->effectiveTestPort);
 						sess->state = SessionState::HTTP_CONNECT_SEND;
 						setDeadline(sess, settings_.handshakeTimeoutMs);
 					} else {
-							prepareHttpGet(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+                            prepareHttpGet(sess, settings_.testHost, sess->effectiveTestPort, settings_.testPath);
 							sess->state = SessionState::HTTP_SEND;
 						setDeadline(sess, settings_.handshakeTimeoutMs);
 					}
 					break;
 				}
-				case Protocol::SOCKS5: prepareSocks5Method(sess); sess->state = SessionState::S5_METHOD_SEND; setDeadline(sess, settings_.handshakeTimeoutMs); break;
-				case Protocol::SOCKS4: prepareSocks4Connect(sess, settings_.testHost, settings_.testPort); sess->state = SessionState::S4_CONNECT_SEND; setDeadline(sess, settings_.handshakeTimeoutMs); break;
+                case Protocol::SOCKS5: {
+                    // For SOCKS, use port 443 by default to avoid HTTP validation issues
+                    uint16_t socksTestPort = (sess->effectiveTestPort == 80) ? 443 : sess->effectiveTestPort;
+                    sess->effectiveTestPort = socksTestPort;
+                    prepareSocks5Method(sess); 
+                    sess->state = SessionState::S5_METHOD_SEND; 
+                    setDeadline(sess, settings_.handshakeTimeoutMs); 
+                    break;
+                }
+                case Protocol::SOCKS4: {
+                    // For SOCKS, use port 443 by default to avoid HTTP validation issues
+                    uint16_t socksTestPort = (sess->effectiveTestPort == 80) ? 443 : sess->effectiveTestPort;
+                    sess->effectiveTestPort = socksTestPort;
+                    prepareSocks4Connect(sess, settings_.testHost, socksTestPort); 
+                    sess->state = SessionState::S4_CONNECT_SEND; 
+                    setDeadline(sess, settings_.handshakeTimeoutMs); 
+                    break;
+                }
 			}
 			arm(sess, /*read*/false, /*write*/true);
 			return;
@@ -942,9 +977,9 @@ private:
 			b.push_back((char)host.size());
 			b.append(host);
 		}
-		uint16_t be = htons(port);
-		b.push_back((char)((be >> 8) & 0xFF));
-		b.push_back((char)(be & 0xFF));
+		// Encode port in network byte order
+		b.push_back((char)((port >> 8) & 0xFF));
+		b.push_back((char)(port & 0xFF));
 		sess->writeOffset = 0;
 		sess->readBuf.clear();
 	}
@@ -954,9 +989,9 @@ private:
 		b.clear();
 		b.push_back((char)0x04); // VN
 		b.push_back((char)0x01); // CONNECT
-		uint16_t be = htons(port);
-		b.push_back((char)((be >> 8) & 0xFF));
-		b.push_back((char)(be & 0xFF));
+		// Encode port in network byte order
+		b.push_back((char)((port >> 8) & 0xFF));
+		b.push_back((char)(port & 0xFF));
 		// SOCKS4a: 0.0.0.1
 		b.push_back((char)0x00);
 		b.push_back((char)0x00);
@@ -1031,11 +1066,11 @@ private:
 			case SessionState::HTTP_CONNECT_RECV: {
 				if (sess->statusCode >= 200 && sess->statusCode < 300) {
 					// For port 80 in strict mode, verify by issuing an HTTP GET inside the tunnel
-					if (sess->worker->settings_.testPort == 80 && sess->worker->settings_.strictPort80BodyIP) {
+                    if (sess->effectiveTestPort == 80 && sess->worker->settings_.strictPort80BodyIP) {
 						sess->readBuf.clear();
 						sess->statusParsed = false;
 						sess->headersComplete = false;
-						sess->worker->prepareTunneledHttpGet(sess, sess->worker->settings_.testHost, sess->worker->settings_.testPort, sess->worker->settings_.testPath);
+                        sess->worker->prepareTunneledHttpGet(sess, sess->worker->settings_.testHost, sess->effectiveTestPort, sess->worker->settings_.testPath);
 						sess->state = SessionState::HTTP_TUNNEL_HTTP_SEND;
 						sess->worker->setDeadline(sess, sess->worker->settings_.requestTimeoutMs);
 						sess->worker->arm(sess, false, true);
@@ -1057,7 +1092,7 @@ private:
 				if (!validResponse) { failSession(sess); return; }
 				// For port 80 in strict mode, require a valid public IPv4 in the body to confirm end-to-end HTTP success
 				// Exception: Google doesn't return client IP, so just check for successful response
-				if (sess->worker->settings_.testPort == 80 && sess->worker->settings_.strictPort80BodyIP && sess->worker->settings_.testHost != "google.com") {
+                if (sess->effectiveTestPort == 80 && sess->worker->settings_.strictPort80BodyIP && sess->worker->settings_.testHost != "google.com") {
 					// Need headers end to parse body
 					size_t hdrEnd = sess->readBuf.find("\r\n\r\n");
 					if (hdrEnd == std::string::npos) {
@@ -1076,7 +1111,7 @@ private:
 					std::string ip;
 					if (extractIPv4StrictFromBody(sess->readBuf.data() + bodyStart, sess->readBuf.size() - bodyStart, ip)) {
 						// If masking required, ensure returned IP differs from our own
-						if (sess->requireIpMasking) {
+                        if (sess->requireIpMasking) {
 							if (sess->worker->settings_.clientPublicIP.empty()) {
 								// No baseline IP available - accept any valid public IP
 								succeedSession(sess);
@@ -1098,25 +1133,11 @@ private:
 					if (sess->readBuf.size() > 131072) { failSession(sess); }
 					return;
 				}
-				// Non-80 or Google: 2xx response is sufficient
+                // Non-80 or Google: 2xx/3xx response is sufficient
 				// For Google, we just need successful connectivity, not IP parsing
-				if (sess->worker->settings_.testHost == "google.com") {
-					// Accept only genuine Google responses - very strict to avoid false positives
-					// Require authentic Google server headers
-					bool hasGoogleServer = (sess->readBuf.find("Server: gws") != std::string::npos ||
-					                       sess->readBuf.find("Server: ESF") != std::string::npos ||
-					                       sess->readBuf.find("Server: sffe") != std::string::npos);
-					if (hasGoogleServer) {
-						succeedSession(sess);
-						return;
-					}
-					// Google test failed - no authentic Google server header
-					failSession(sess);
-					return;
-				}
-				// Non-80: 2xx is sufficient here
-				succeedSession(sess);
-				return;
+                // Allow 3xx as success as well (common with bot detection).
+                succeedSession(sess);
+                return;
 			}
 			default:
 				break;
@@ -1128,22 +1149,59 @@ private:
 		unsigned char ver = (unsigned char)sess->readBuf[0];
 		unsigned char method = (unsigned char)sess->readBuf[1];
 		if (ver != 5 || method != 0x00) { failSession(sess); return; }
-		// Proceed to CONNECT
-		prepareSocks5Connect(sess, settings_.testHost, settings_.testPort);
+        // Proceed to CONNECT
+        prepareSocks5Connect(sess, settings_.testHost, sess->effectiveTestPort);
 		sess->state = SessionState::S5_CONNECT_SEND;
 		setDeadline(sess, settings_.handshakeTimeoutMs);
 		arm(sess, false, true);
 	}
 
 	void parseSocks5Connect(Session* sess) {
-		if (sess->readBuf.size() < 2) return;
+		// SOCKS5 CONNECT response format:
+		// +----+-----+-------+------+----------+----------+
+		// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+		// +----+-----+-------+------+----------+----------+
+		// | 1  |  1  | X'00' |  1   | Variable |    2     |
+		// +----+-----+-------+------+----------+----------+
+		
+		// Need at least 4 bytes to read VER, REP, RSV, ATYP
+		if (sess->readBuf.size() < 4) return;
+		
 		unsigned char ver = (unsigned char)sess->readBuf[0];
 		unsigned char rep = (unsigned char)sess->readBuf[1];
+		unsigned char rsv = (unsigned char)sess->readBuf[2];
+		unsigned char atyp = (unsigned char)sess->readBuf[3];
+		
+		// Check version and reply code
 		if (ver != 5 || rep != 0x00) { failSession(sess); return; }
-		// If testing port 80, we can do an HTTP HEAD over the tunnel for content check.
-		// For non-80 (e.g., 443), avoid sending plaintext HTTP; consider CONNECT success as pass.
-		if (settings_.testPort == 80) {
-			prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+		
+		// Calculate expected response length based on address type
+		size_t expectedLen;
+		if (atyp == 0x01) {
+			// IPv4: 4 + 4 + 2 = 10 bytes total
+			expectedLen = 10;
+		} else if (atyp == 0x03) {
+			// Domain name: need at least 5 bytes to read length
+			if (sess->readBuf.size() < 5) return;
+			unsigned char domainLen = (unsigned char)sess->readBuf[4];
+			expectedLen = 4 + 1 + domainLen + 2;
+		} else if (atyp == 0x04) {
+			// IPv6: 4 + 16 + 2 = 22 bytes total
+			expectedLen = 22;
+		} else {
+			// Unsupported address type
+			failSession(sess);
+			return;
+		}
+		
+		// Wait for complete response
+		if (sess->readBuf.size() < expectedLen) return;
+		
+		// Response is complete, proceed with connection
+        // If testing port 80, we can do an HTTP HEAD over the tunnel for content check.
+        // For non-80 (e.g., 443), avoid sending plaintext HTTP; consider CONNECT success as pass.
+        if (sess->effectiveTestPort == 80) {
+            prepareSocksHttpGet(sess, settings_.testHost, sess->effectiveTestPort, settings_.testPath);
 			sess->state = SessionState::SOCKS_HTTP_SEND;
 			arm(sess, false, true);
 		} else {
@@ -1155,9 +1213,9 @@ private:
 		if (sess->readBuf.size() < 2) return;
 		unsigned char vn = (unsigned char)sess->readBuf[0];
 		unsigned char cd = (unsigned char)sess->readBuf[1];
-		if (vn != 0x00 || cd != 0x5A) { failSession(sess); return; }
-		if (settings_.testPort == 80) {
-			prepareSocksHttpHead(sess, settings_.testHost, settings_.testPort, settings_.testPath);
+        if (vn != 0x00 || cd != 0x5A) { failSession(sess); return; }
+        if (sess->effectiveTestPort == 80) {
+            prepareSocksHttpGet(sess, settings_.testHost, sess->effectiveTestPort, settings_.testPath);
 			sess->state = SessionState::SOCKS_HTTP_SEND;
 			arm(sess, false, true);
 		} else {
@@ -1199,17 +1257,15 @@ static void usage(const char* argv0) {
 	std::cerr << "  --queue-size N        Bounded queue capacity for range scanning (default: workers*concurrency*2)\n";
 	std::cerr << "  --max-retries N       Maximum retry attempts for failed connections (default: 2)\n";
 	std::cerr << "  --disable-ip-masking  Disable IP masking validation for HTTP proxies on port 80\n";
-	std::cerr << "  --multi-protocol      Test all protocols even when --default-proto is specified\n";
 	std::cerr << "  --strict              Enable strict validation (port 80 requires body IP, tunneled GET) [default: enabled]\n";
 	std::cerr << "  --no-strict           Disable strict validation (allow any 2xx response as success)\n";
 	    std::cerr << "\n";
 	    std::cerr << "Notes:\n";
-	    std::cerr << "  - If a line omits protocol (e.g., ip:port) and --default-proto is NOT provided,\n";
-	    std::cerr << "    the checker tries all supported protocols/modes: HTTP CONNECT, HTTP DIRECT, SOCKS4, SOCKS5.\n";
+	    std::cerr << "  - By default, if a line omits protocol (e.g., ip:port), the checker tests ALL supported\n";
+	    std::cerr << "    protocols/modes: HTTP CONNECT, HTTP DIRECT, SOCKS4, SOCKS5.\n";
 	    std::cerr << "  - If --default-proto is provided, unspecified lines are tested ONLY with that protocol\n";
 	    std::cerr << "    (HTTP uses --http-mode). Lines that explicitly specify a protocol are honored as-is.\n";
 	    std::cerr << "  - --in, --range, and --range-file are mutually exclusive.\n";
-	    std::cerr << "  - --multi-protocol forces testing all protocols regardless of --default-proto setting.\n";
 	std::cerr << std::flush;
 }
 
@@ -1354,11 +1410,22 @@ static bool readProxies(const std::string& path, const Settings& s, std::vector<
         if (!v) continue;
         const ParsedProxyLine& pl = *v;
 		if (pl.explicitProto) {
-			// Honor explicit protocol lines as-is
-			out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
+            // Honor explicit protocol lines as-is.
+            // If https scheme was used, force HTTP CONNECT mode for validation.
+            if (pl.proto == Protocol::HTTP) {
+                if (pl.httpsScheme) {
+                    ProxyTarget t{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT};
+                    t.testPortOverride = 443;
+                    out.push_back(std::move(t));
+                } else {
+                    out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, std::nullopt});
+                }
+            } else {
+                out.push_back(ProxyTarget{pl.proto, pl.host, pl.port, std::nullopt});
+            }
 		} else {
 			// Protocol omitted in input
-			if (s.defaultProtocolForced && !s.multiProtocolTest) {
+			if (s.defaultProtocolForced) {
 				// Enforce the specified default protocol only
 				switch (s.defaultProtocol) {
 					case Protocol::HTTP:
@@ -1372,7 +1439,7 @@ static bool readProxies(const std::string& path, const Settings& s, std::vector<
 						break;
 				}
 			} else {
-				// Try all protocols and HTTP modes by default or when multi-protocol mode is enabled
+				// Try all protocols and HTTP modes by default
 				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::CONNECT});
 				out.push_back(ProxyTarget{Protocol::HTTP, pl.host, pl.port, HttpMode::DIRECT});
 				out.push_back(ProxyTarget{Protocol::SOCKS5, pl.host, pl.port, std::nullopt});
@@ -1433,7 +1500,7 @@ static bool generateProxiesFromRange(const Settings& s, std::vector<ProxyTarget>
     enumerateIPsInCIDR(network, maskBits, ips);
     if (ips.empty()) return true;
     auto pushForPort = [&](const std::string& ip, uint16_t port){
-        if (s.defaultProtocolForced && !s.multiProtocolTest) {
+        if (s.defaultProtocolForced) {
             switch (s.defaultProtocol) {
                 case Protocol::HTTP:
                     out.push_back(ProxyTarget{Protocol::HTTP, ip, port, s.httpMode});
@@ -1486,7 +1553,7 @@ static void generateProxiesFromCIDR(uint32_t network, uint32_t maskBits, const S
         }
         const std::string ipStr(buf);
         auto pushForPort = [&](uint16_t port){
-            if (s.defaultProtocolForced && !s.multiProtocolTest) {
+            if (s.defaultProtocolForced) {
                 switch (s.defaultProtocol) {
                     case Protocol::HTTP:
                         out.push_back(ProxyTarget{Protocol::HTTP, ipStr, port, s.httpMode});
@@ -1575,9 +1642,8 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
             fprintf(stderr, "\r%s %5.1f%% | IPs: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
                     bar.c_str(), pct, ipUnitsDone, s.totalIpsForProgress, ok, bad);
         } else {
-            uint64_t current = (started < total) ? started : total;
-            buildProgressBar(current, total, 28, bar);
-            double pct = (total == 0) ? 0.0 : (double)current * 100.0 / (double)total;
+            buildProgressBar(checked, total, 28, bar);
+            double pct = (total == 0) ? 0.0 : (double)checked * 100.0 / (double)total;
             fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64,
                     bar.c_str(), pct, checked, total, ok, bad);
         }
@@ -1601,7 +1667,7 @@ static void progressLoop(const Settings& s, const Counters& counters, std::atomi
     } else {
         buildProgressBar(total, total, 28, bar);
         fprintf(stderr, "\r%s %5.1f%% | Checked: %" PRIu64 "/%" PRIu64 " | Succeeded: %" PRIu64 ", Failed: %" PRIu64 "\n",
-                bar.c_str(), 100.0, checked, total, ok, bad);
+                bar.c_str(), 100.0, total, total, ok, bad);
     }
     fflush(stderr);
 }
@@ -1655,7 +1721,7 @@ int main(int argc, char** argv) {
 			totalIps = countIPsInCIDR(bits);
 		}
 		settings.totalIpsForProgress = totalIps;
-		uint64_t protocolsPerTarget = (settings.defaultProtocolForced && !settings.multiProtocolTest) ? 1ULL : 4ULL;
+		uint64_t protocolsPerTarget = settings.defaultProtocolForced ? 1ULL : 4ULL;
 		if (settings.scanAllPorts) {
 			settings.totalPortsForProgress = totalIps * 65535ULL;
 			settings.sessionsPerPortForProgress = (uint32_t)protocolsPerTarget;
@@ -1728,7 +1794,7 @@ int main(int argc, char** argv) {
 		taskQueue = std::make_shared<TaskQueue>((size_t)capacity);
 		// Producer lambda for pushing tasks on-the-fly
 		auto pushForIpPort = [&](const std::string& ipStr, uint16_t port){
-			if (settings.defaultProtocolForced && !settings.multiProtocolTest) {
+			if (settings.defaultProtocolForced) {
 				switch (settings.defaultProtocol) {
 					case Protocol::HTTP:
 						(void)taskQueue->push(ProxyTarget{Protocol::HTTP, ipStr, port, settings.httpMode});
